@@ -18,12 +18,37 @@ permissions:
 
 jobs:
   sync-wiki:
+    if: github.event.repository.has_wiki
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v7
 
+      # GitHub creates a separate Git repository only after the first wiki page
+      # is saved. Forks inherit this workflow, but not the parent's wiki.
+      - name: Check whether the fork wiki exists
+        if: github.event.repository.fork
+        id: wiki
+        env:
+          WIKI_URL: ${{ github.server_url }}/${{ github.repository }}.wiki.git
+          GIT_TERMINAL_PROMPT: 0
+          LC_ALL: C
+        shell: bash
+        run: |
+          if git ls-remote "$WIKI_URL" HEAD >"$RUNNER_TEMP/wiki-head" 2>"$RUNNER_TEMP/wiki-error"; then
+            if [[ -s "$RUNNER_TEMP/wiki-head" ]]; then
+              echo 'ready=true' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          elif ! grep -Fqi 'repository not found' "$RUNNER_TEMP/wiki-error"; then
+            cat "$RUNNER_TEMP/wiki-error" >&2
+            exit 1
+          fi
+          echo 'ready=false' >> "$GITHUB_OUTPUT"
+          echo 'Wiki sync skipped. Save a first page in the fork wiki to enable publishing.' >> "$GITHUB_STEP_SUMMARY"
+
       - name: Sync docs/wiki to GitHub Wiki
+        if: ${{ !github.event.repository.fork || steps.wiki.outputs.ready == 'true' }}
         uses: Andrew-Chen-Wang/github-wiki-action@v5
         with:
           path: docs/wiki
