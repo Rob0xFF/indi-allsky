@@ -12,6 +12,7 @@ from flask import Flask, abort, current_app, request
 import pytest
 
 from indi_allsky.companion_astronomy import camera_timezone, night_ephemeris
+from indi_allsky.archive_health import BLOCKED
 
 
 @pytest.fixture(scope='module')
@@ -24,7 +25,8 @@ def functions():
                  ephem=ephem, request=request, abort=abort, camera_timezone=camera_timezone,
                  app=current_app, ipaddress=ipaddress, socket=socket, cached_property=cached_property,
                  psutil=SimpleNamespace(net_if_addrs=lambda: {}),
-                 night_ephemeris=night_ephemeris,
+                 night_ephemeris=night_ephemeris, BLOCKED=BLOCKED, Path=Path,
+                 archive_state=lambda config: {}, ups_problem=lambda path: False,
                  companion_charts=lambda *args, **kwargs: ([], [], [{'id': 'test-series'}]))
     for filename in ('base_views.py', 'views.py', 'companion.py'):
         path = directory / filename
@@ -132,3 +134,17 @@ def test_image_and_history_share_request_visibility(functions, monkeypatch, remo
     source = 'local' if expected else 'remote'
     assert data['image']['url'] == source
     assert data['series'] == [source]
+
+
+def test_local_archive_unavailable_keeps_status_available(functions, monkeypatch):
+    app = Flask(__name__)
+    view = view_for(functions, 45, 10, False)
+    camera = view.getCameraById(3)
+    camera.local = True
+    view.local_images_allowed = True
+    monkeypatch.setitem(functions.companion_status.__globals__, 'archive_state',
+                        lambda config: {'level': BLOCKED, 'reason': 'mount', 'mount':'/private/path'})
+    app.add_url_rule('/status', view_func=lambda: functions.companion_status(view))
+    data = app.test_client().get('/status?camera_id=3&image_only=1').get_json()
+    assert data['archive'] == 'mount' and data['image'] is None
+    assert '/private/path' not in str(data)

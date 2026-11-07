@@ -4,6 +4,8 @@ from pathlib import Path
 from flask import abort, render_template, request, session
 from sqlalchemy.orm.exc import NoResultFound
 
+from ..archive_health import archive_state, BLOCKED
+from ..sensor_health import ups_problem
 from ..companion_astronomy import camera_timezone, night_ephemeris
 from .base_views import BaseView
 from .companion_charts import companion_charts
@@ -44,16 +46,23 @@ def companion_status(view):
 
     zone = camera_timezone(view.camera)
     now = datetime.now(timezone.utc).astimezone(zone)
+    shows_local_archive = view.local_indi_allsky and view.local_images_allowed
+    archive = archive_state(view.indi_allsky_config) if shows_local_archive else {}
     data = {
         'camera_id': view.camera.id,
         'now': now.isoformat(),
         'time_zone': getattr(zone, 'key', None),
         'offset_minutes': int(now.utcoffset().total_seconds() / 60),
         'capture_paused': bool(view.camera.capture_pause),
-        'image': latest_companion_image(view, now),
+        'image': None if archive.get('level') == BLOCKED else latest_companion_image(view, now),
     }
+    if shows_local_archive:
+        # Only the code leaves the Pi. Mount paths and host details stay local.
+        data['archive'] = archive.get('reason', 'ok')
     # The browser can discover a published frame promptly without recomputing
     # two hours of sensor readings and the ephemerides on each image check.
+    if shows_local_archive:
+        data['ups_unreadable'] = ups_problem(Path('/run/indi-allsky-ups-watchdog/health.json'))
     if request.args.get('image_only') == '1':
         return data
 

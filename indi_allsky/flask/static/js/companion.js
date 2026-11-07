@@ -19,6 +19,15 @@
     let imageServiceMessage = '';
     let detailMessage = '';
     let capturePaused = false;
+    let archiveIssue = '';
+    const archiveMessages = {
+        mount: 'Archiv nicht eingehängt', missing: 'Archivordner fehlt',
+        reserve: 'Archiv fast voll · Zeitraffer und Exporte warten',
+        full: 'Archiv voll · Aufnahme pausiert', readonly: 'Archiv schreibgeschützt · Aufnahme pausiert',
+        write: 'Archiv nicht beschreibbar', timeout: 'Archiv antwortet nicht', checking: 'Archiv wird geprüft',
+        unknown: 'Archivstatus nicht lesbar',
+    };
+    let upsUnreadable = false;
     let lastPayload;
     const staleAfter = Number(page.dataset.staleMs) || 90000;
 
@@ -93,6 +102,8 @@
         } else if (imageMessage) lines.push(imageMessage);
         else if (capturePaused) lines.push('Pi erreichbar · Aufnahme pausiert');
         else if (imageIsLate()) lines.push('Pi erreichbar · keine neue Aufnahme');
+        if (archiveIssue) lines.push(archiveIssue);
+        if (upsUnreadable) lines.push('USV nicht auslesbar');
         if (detailMessage && !lines.includes(detailMessage)) lines.push(detailMessage);
         const message = byId('connection-message');
         const text = lines.join(' ');
@@ -184,16 +195,16 @@
             x: Date.parse(time), y: Number.isFinite(value) ? value : null, capturedAt: time,
         })).filter(point => Number.isFinite(point.x));
         const values = samples.filter(point => point.y !== null);
-        const last = values[values.length - 1];
+        const last = samples[samples.length - 1];
         reading.hidden = !last;
-        reading.textContent = last ? formatReading(last.y) + (series.unit ? ' ' + series.unit : '') : '';
+        reading.textContent = last && last.y !== null ? formatReading(last.y) + (series.unit ? ' ' + series.unit : '') : '–';
         // Equal wall times on either side of a clock change have different UTC offsets.
         const sampleTime = point => {
             const time = dateAndTime(point.capturedAt);
             const offset = point.capturedAt.match(/[+-]\d{2}:\d{2}$/);
             return time.time + ' UTC' + (offset ? offset[0] : '');
         };
-        if (last) reading.title = 'Letzter Messwert um ' + sampleTime(last);
+        reading.title = last ? (last.y === null ? 'Keine gültige Messung um ' : 'Letzter Messwert um ') + sampleTime(last) : '';
         const visible = values.length > 0 && typeof Chart === 'function';
         plot.hidden = !visible;
         empty.hidden = !selects[slot].value || visible;
@@ -268,6 +279,8 @@
     }, 2000, payload => {
         updateClock(payload);
         capturePaused = payload.capture_paused === true;
+        archiveIssue = archiveMessages[payload.archive] || '';
+        upsUnreadable = payload.ups_unreadable === true;
         updateImage(payload.image);
         imageServiceMessage = '';
         tick();

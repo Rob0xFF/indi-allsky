@@ -203,3 +203,23 @@ test('companion differentiates missing, transferring, paused, offline and authen
     assert.match(message(), /Anmeldung erforderlich/);
     assert.equal(b.displays.length, 1);
 });
+
+test('companion clears a stale chart reading and reports an unreadable local UPS', async () => {
+    const b = browser('companion');
+    const payload = full(null);
+    const metric = {id: 'sensor_user_35', label: 'Lux', unit: 'lx'};
+    Object.assign(payload, {metrics: [metric], defaults: [metric.id],
+        series: [{...metric, points: [['2026-11-07T20:59:00+01:00', 2], ['2026-11-07T21:00:00+01:00', null]]}]});
+    b.requests[0].reply({...status(null), ups_unreadable: true});
+    b.requests[1].reply(payload);
+    await b.flush();
+    assert.equal(b.el('chart-slot-1.chart-value').textContent, '–');
+    assert.match(b.el('connection-message').textContent, /USV nicht auslesbar/);
+    b.emit('online');
+    payload.series[0].points.push(['2026-11-07T21:01:00+01:00', 0]);
+    b.requests.at(-2).reply({...status(null), ups_unreadable: false});
+    b.requests.at(-1).reply(payload);
+    await b.flush();
+    assert.equal(b.el('chart-slot-1.chart-value').textContent, '0 lx');
+    assert.doesNotMatch(b.el('connection-message').textContent, /USV nicht auslesbar/);
+});
