@@ -275,6 +275,7 @@ class SyncApiBaseView(BaseView):
 
 
     def deleteFile(self, entry_id, camera_id):
+        from ..media_delete import suppress_deleted_local_product
         # we do not want to call deleteAsset() here
         try:
             entry = self.model.query\
@@ -284,6 +285,7 @@ class SyncApiBaseView(BaseView):
                 .one()
 
 
+            suppress_deleted_local_product(entry)
             entry.deleteFile()
 
             app.logger.warning('Deleting entry %d', entry.id)

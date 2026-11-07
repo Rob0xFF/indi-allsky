@@ -6485,6 +6485,8 @@ class AjaxSystemInfoView(BaseView):
 
 
     def flushTimelapses(self, camera_id):
+        from ..media_delete import suppress_flushed_periods
+        suppress_flushed_periods(self.indi_allsky_config, camera_id)
         video_query = IndiAllSkyDbVideoTable.query\
             .join(IndiAllSkyDbVideoTable.camera)\
             .filter(IndiAllSkyDbCameraTable.id == camera_id)\
@@ -6546,6 +6548,8 @@ class AjaxSystemInfoView(BaseView):
 
 
     def flushDaytime(self, camera_id):
+        from ..media_delete import suppress_flushed_periods
+        suppress_flushed_periods(self.indi_allsky_config, camera_id, daytime_only=True)
         ### Images
         image_query = IndiAllSkyDbImageTable.query\
             .join(IndiAllSkyDbImageTable.camera)\
@@ -7233,8 +7237,13 @@ class AjaxTimelapseGeneratorView(BaseView):
             .one()
 
 
-        if night and action in ('delete_video_k_st_p', 'delete_video'):
-            suppress_repair(camera.id, day_date)
+        if action in ('delete_video_k_st_p', 'delete_video'):
+            suppress_repair(camera.id, day_date, night)
+        if action in ('delete_video_k_st_p', 'delete_panorama_video'):
+            suppress_repair(camera.id, day_date, night, panorama=True)
+        if action in ('delete_video_k_st_p', 'delete_k_st'):
+            from ..derived_media import suppress_repair as suppress_derived
+            suppress_derived(camera.id, day_date, night)
 
         if action == 'delete_video_k_st_p':
             video_entry = IndiAllSkyDbVideoTable.query\
@@ -11411,8 +11420,9 @@ class TimelapseVideoView(TemplateView):
         else:
             context['timeofday'] = 'Day'
 
-        if local and self.model is IndiAllSkyDbVideoTable and video.night and video.camera.local:
-            record = db.session.get(IndiAllSkyDbStateTable, attempt_key(video.camera_id, video.dayDate))
+        if local and self.model in (IndiAllSkyDbVideoTable, IndiAllSkyDbPanoramaVideoTable) and video.camera.local:
+            key = attempt_key(video.camera_id, video.dayDate, video.night, self.model is IndiAllSkyDbPanoramaVideoTable)
+            record = db.session.get(IndiAllSkyDbStateTable, key)
             context['night_movie_status'] = prior_attempt(record, video.dayDate).get('result')
 
         context['dayDate_full'] = video.dayDate.strftime('%B %d, %Y')

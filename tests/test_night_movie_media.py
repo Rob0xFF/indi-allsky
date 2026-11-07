@@ -47,3 +47,9 @@ class NightMovieMediaTests(unittest.TestCase):
         slot = SimpleNamespace(value='{"day":"2026-11-01","deleted":true}')
         self.assertEqual(prior_attempt(slot, date(2026, 11, 5)), {})
         self.assertTrue(prior_attempt(slot, date(2026, 11, 1))['deleted'])
+def test_encoder_config_changes_unlock_a_new_repair_attempt():
+    from indi_allsky.night_movie import movie_inputs
+    cfg = {'FFMPEG_CODEC': 'libx264', 'IMAGE_FILE_TYPE': 'jpg'}
+    before = movie_inputs('sources', cfg)
+    assert movie_inputs('sources', dict(cfg, unrelated=42)) == before
+    assert movie_inputs('sources', dict(cfg, FFMPEG_CODEC='libx265')) != before

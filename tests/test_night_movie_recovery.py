@@ -23,6 +23,7 @@ def station(tmp_path, monkeypatch):
     db.init_app(app)
     business_day = date.today()
     monkeypatch.setattr('indi_allsky.utils.IndiAllSkyDateCalcs.getDayDate', lambda self: business_day)
+    monkeypatch.setattr('indi_allsky.derived_media.reconcile', lambda *args: False)
     monkeypatch.setattr('indi_allsky.archive_health.archive_paused', lambda _: False)
     with app.app_context():
         db.create_all()
@@ -138,3 +139,122 @@ def test_upload_failure_does_not_mark_good_local_repair_as_failed(station):
     night_movie.reconcile(worker)
     assert Task.query.one().state == TaskQueueState.SUCCESS
     assert night_movie.playable(Path(Movie.query.one().getFilesystemPath()))
+
+
+def pano_frames(worker, camera, date, night, count, prefix='panorama'):
+    from indi_allsky.flask.models import IndiAllSkyDbPanoramaImageTable as PanoFrame
+    for i in range(count):
+        name = f'{prefix}-{i}.jpg'
+        Image.new('RGB', (128, 24), (20*i, 80, 100)).save(worker.image_dir / name)
+        db.session.add(PanoFrame(camera_id=camera.id, dayDate=date, filename=name, createDate=datetime.now(),
+                                 night=night, exposure=1, gain=1))
+    db.session.commit()
+
+
+@pytest.mark.skipif(not shutil.which('ffmpeg'), reason='ffmpeg required')
+def test_panorama_day_night_are_distinct_and_existing_failed_id_has_priority(station):
+    from indi_allsky.flask.models import IndiAllSkyDbPanoramaVideoTable as PanoMovie
+    worker, camera, today, add_frame = station
+    worker.config.update(FISH2PANO={'ENABLE': True}, TIMELAPSE_SKIP_FRAMES=4)
+    date = today - timedelta(days=2)
+    add_frame('more-recent-regular.jpg')
+    missing = PanoMovie(camera_id=camera.id, dayDate=date, night=True, filename='broken.mp4', success=False)
+    db.session.add(missing)
+    db.session.commit()
+    watch_id = missing.id
+    for night in (False, True):
+        pano_frames(worker, camera, date, night, 6, str(night))
+    assert night_movie.reconcile(worker)
+    fixed = db.session.get(PanoMovie, watch_id)
+    assert fixed.success and fixed.frames == 2 and night_movie.playable(Path(fixed.getFilesystemPath()))
+    assert not PanoMovie.query.filter_by(night=False).first()
+    assert night_movie.reconcile(worker)
+    daytime = PanoMovie.query.filter_by(night=False).one()
+    assert daytime.frames == 2 and night_movie.playable(Path(daytime.getFilesystemPath()))
+    assert not night_movie.reconcile(worker)
+    assert PanoMovie.query.count() == 2
+
+
+@pytest.mark.skipif(not shutil.which('ffmpeg'), reason='ffmpeg required')
+def test_explicit_panorama_delete_during_repair_keeps_day_and_night_separate(station, monkeypatch):
+    from indi_allsky.flask.models import IndiAllSkyDbPanoramaVideoTable as PanoMovie
+    from indi_allsky.timelapse import TimelapseGenerator
+    worker, camera, today, _ = station
+    day = today - timedelta(days=2)
+    worker.config.update(FISH2PANO={'ENABLE': True})
+    pano_frames(worker, camera, day, False, 2)
+    original = TimelapseGenerator.generate
+    def cancel(self, path, frames):
+        original(self, path, frames)
+        night_movie.suppress_repair(camera.id, day, False, panorama=True)
+    monkeypatch.setattr(TimelapseGenerator, 'generate', cancel)
+    night_movie.reconcile(worker)
+    assert PanoMovie.query.count() == 0
+    assert Task.query.one().state == TaskQueueState.EXPIRED
+    assert not list(worker.image_dir.rglob('*.mp4'))
+    night_movie.reconcile(worker)
+    assert Task.query.count() == 1
+    monkeypatch.setattr(TimelapseGenerator, 'generate', original)
+    pano_frames(worker, camera, day, True, 2, 'night')
+    night_movie.reconcile(worker)
+    assert PanoMovie.query.one().night
+
+
+def test_panorama_disabled_day_and_active_period_are_skipped(station):
+    from indi_allsky.flask.models import IndiAllSkyDbPanoramaVideoTable as PanoMovie
+    worker, camera, today, _ = station
+    day = today - timedelta(days=1)
+    pano_frames(worker, camera, day, False, 2)
+    pano_frames(worker, camera, today, True, 2, 'active')
+    night_movie.reconcile(worker)
+    worker.config.update(FISH2PANO={'ENABLE': True}, DAYTIME_TIMELAPSE=False)
+    night_movie.reconcile(worker)
+    assert Task.query.count() == 0 and PanoMovie.query.count() == 0
+
+
+@pytest.mark.skipif(not shutil.which('ffmpeg'), reason='ffmpeg required')
+def test_older_retained_date_and_legacy_tombstone_do_not_collide(station):
+    from indi_allsky.flask.models import IndiAllSkyDbStateTable as State
+    import json
+    worker, camera, today, add_frame = station
+    a, b = today - timedelta(days=2), today - timedelta(days=6)
+    add_frame('recent.jpg', a)
+    add_frame('older.jpg', b)
+    add_frame('outside.jpg', today - timedelta(days=11))
+    db.session.add(State(key=f'NIGHTMOVIE_{camera.id}_{a.toordinal() % 4}',
+                         value=json.dumps({'day': a.isoformat(), 'deleted':True})))
+    db.session.commit()
+    night_movie.reconcile(worker)
+    assert Movie.query.one().dayDate == b
+    assert not night_movie.reconcile(worker)
+    assert Movie.query.count() == 1
+
+
+@pytest.mark.skipif(not shutil.which('ffmpeg'), reason='ffmpeg required')
+def test_interrupted_encode_retries_once_after_cooldown(station, monkeypatch):
+    import json
+    from indi_allsky.flask.models import IndiAllSkyDbStateTable as State
+    worker, camera, today, add_frame = station
+    day = today - timedelta(days=1)
+    add_frame('image.jpg')
+    real_time = night_movie.time.time
+    start = real_time()
+    def stop_task(task, **kwargs):
+        raise KeyboardInterrupt  # simulate power loss after committing reservation
+    worker.generateVideo = stop_task
+    with pytest.raises(KeyboardInterrupt):
+        night_movie.reconcile(worker)
+    first = Task.query.one()
+    first.setExpired()
+    night_movie.reconcile(worker)
+    assert Task.query.count() == 1  # cooldown
+    monkeypatch.setattr(night_movie.time, 'time', lambda:start+121)
+    with pytest.raises(KeyboardInterrupt):
+        night_movie.reconcile(worker)
+    second = Task.query.order_by(Task.id.desc()).first()
+    second.setExpired()
+    monkeypatch.setattr(night_movie.time, 'time', lambda:start+242)
+    night_movie.reconcile(worker)
+    assert Task.query.count() == 2 and Movie.query.count() == 0
+    record = db.session.get(State, night_movie.attempt_key(camera.id, day))
+    assert json.loads(record.value)['attempt'] == 2

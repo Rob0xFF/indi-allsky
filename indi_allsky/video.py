@@ -26,13 +26,12 @@ from . import asi676mc_calibration
 
 from .timelapse import TimelapseGenerator
 from . import night_movie
+from . import derived_media
 from .panorama import buildPanoramaCropFilter
 from .panorama import buildPanoramaPanFilter
 from .panorama import buildPanoramaTimedPanFilter
 from .panorama import cropPanoramaArray
 from .panorama import validatePanoramaAspectRatio
-from .keogram import KeogramGenerator
-from .starTrails import StarTrailGenerator
 from .miscUpload import miscUpload
 from .aurora import IndiAllskyAuroraUpdate
 from .smoke import IndiAllskySmokeUpdate
@@ -73,7 +72,6 @@ import queue
 
 from .exceptions import TimelapseException
 from .exceptions import TimeOutException
-from .exceptions import KeogramMismatchException
 from .exceptions import BackupFailure
 
 
@@ -205,7 +203,8 @@ class VideoWorker(Process):
                 next_movie_check = time.monotonic() + 3600
                 with app.app_context():
                     try:
-                        night_movie.reconcile(self)
+                        if night_movie.reconcile(self):
+                            next_movie_check = time.monotonic() + 60
                     except Exception:
                         db.session.rollback()
                         logger.exception('Unable to check recent night timelapses')
@@ -759,7 +758,7 @@ class VideoWorker(Process):
             with night_movie.staged_movie(video_file, tg.ffmpeg_bin) as stage:
                 tg.generate(stage, timelapse_files)
 
-            if repair and not night_movie.lock_repair(camera.id, d_dayDate, kwargs.get('repair_token')):
+            if repair and not night_movie.lock_repair(camera.id, d_dayDate, kwargs.get('repair_token'), night=night):
                 db.session.rollback()
                 video_file.unlink(missing_ok=True)
                 task.setExpired()
@@ -1372,40 +1371,22 @@ class VideoWorker(Process):
         )
 
 
-        try:
-            # delete old video entry if it exists
-            old_panorama_video_entry = IndiAllSkyDbPanoramaVideoTable.query\
-                .join(IndiAllSkyDbPanoramaVideoTable.camera)\
-                .filter(
-                    and_(
-                        IndiAllSkyDbCameraTable.id == camera.id,
-                        IndiAllSkyDbPanoramaVideoTable.dayDate == d_dayDate,
-                        IndiAllSkyDbPanoramaVideoTable.night == night,
-                    )
-                )\
-                .one()
-
-
-            if not self.config.get('TIMELAPSE_OVERWRITE'):
-                logger.error('Panorama Timelapse already exists, overwrite not permitted')
-                task.setFailed('Panorama Timelapse already exists, overwrite not permitted')
+        matches = IndiAllSkyDbPanoramaVideoTable.query.filter_by(camera_id=camera.id, dayDate=d_dayDate, night=night).all()
+        if len(matches) > 1:
+            task.setFailed('Multiple panorama timelapses exist for this camera and period; review before replacing.')
+            return
+        previous = matches[0] if matches else None
+        repair = kwargs.get('repair', False)
+        if previous:
+            if repair:
+                if previous.remote_url or previous.s3_key or night_movie.playable(Path(previous.getFilesystemPath())):
+                    task.setSuccess('Existing panorama timelapse preserved')
+                    return
+            elif not self.config.get('TIMELAPSE_OVERWRITE'):
+                task.setFailed('Panorama timelapse already exists, overwrite not permitted')
                 return
-
-
-            logger.warning('Removing old panorama video db entry')
-
-            old_panorama_video_entry.deleteAsset()
-
-            db.session.delete(old_panorama_video_entry)
-            db.session.commit()
-        except NoResultFound:
-            pass
-
-
-        if video_file.exists():
-            logger.warning('Removing orphaned panorama video file: %s', video_file)
-            video_file.unlink()
-
+        if video_file.exists() or (previous and Path(previous.getFilesystemPath()) == video_file):
+            video_file = video_file.with_name(video_file.stem.rsplit('_', 1)[0] + '_' + str(time.time_ns()) + video_file.suffix)
 
         # find all files
         timelapse_files_entries = IndiAllSkyDbPanoramaImageTable.query\
@@ -1482,6 +1463,12 @@ class VideoWorker(Process):
 
 
         timelapse_skip_frames = self.config.get('TIMELAPSE_SKIP_FRAMES', 4)
+        if repair:
+            timelapse_files = list(night_movie.readable_images(timelapse_files))
+        if len(timelapse_files) <= timelapse_skip_frames:
+            task.setFailed('Panorama {} {}: insufficient readable source images ({} usable, {} skipped).'.format(
+                timeofday, timespec, len(timelapse_files), timelapse_skip_frames))
+            return
 
         video_metadata = {
             'type'          : constants.PANORAMA_VIDEO,
@@ -1490,7 +1477,7 @@ class VideoWorker(Process):
             'dayDate'       : d_dayDate.strftime('%Y%m%d'),
             'night'         : night,
             'framerate'     : self.config['FFMPEG_FRAMERATE'],
-            'frames'        : timelapse_files_entries_count - timelapse_skip_frames,
+            'frames'        : len(timelapse_files) - timelapse_skip_frames,
             'camera_uuid'   : camera.uuid,
         }
 
@@ -1503,14 +1490,6 @@ class VideoWorker(Process):
             'max_moonphase'     : max_moonphase,
             'avg_sqm'           : avg_sqm,
         }
-
-
-        # Create DB entry before creating file
-        video_entry = self._miscDb.addPanoramaVideo(
-            video_file.relative_to(self.image_dir),
-            camera.id,
-            video_metadata,
-        )
 
 
         if self.config.get('TIMELAPSE', {}).get('USE_NIGHT_CONFIG', True):
@@ -1540,34 +1519,37 @@ class VideoWorker(Process):
             #panorama_tg.vf_scale = vf_scale  # no vfscale for panorama timelapse
             panorama_tg.ffmpeg_extra_options = ffmpeg_extra_options
 
-            panorama_tg.generate(video_file, timelapse_files)
-
-
+            with night_movie.staged_movie(video_file, panorama_tg.ffmpeg_bin) as stage:
+                panorama_tg.generate(stage, timelapse_files)
+            if repair and not night_movie.lock_repair(camera.id, d_dayDate, kwargs.get('repair_token'), night, True):
+                db.session.rollback()
+                video_file.unlink(missing_ok=True)
+                task.setExpired()
+                return
+            video_metadata.update(fileSize=video_file.stat().st_size, framerate=framerate, success=True)
+            previous_path = Path(previous.getFilesystemPath()) if previous else None
             try:
-                fileSize = video_file.stat().st_size
-            except FileNotFoundError:
-                fileSize = None
-
-
-            video_entry.fileSize = fileSize
-            video_metadata['fileSize'] = fileSize
-
-
-            video_entry.success = True
-            db.session.commit()
-        except TimelapseException:
-            self._miscDb.addNotification(
-                NotificationCategory.MEDIA,
-                'timelapse_video',
-                'Timelapse panorama video failed to generate',
-                expire=timedelta(hours=12),
-            )
-
-            task.setFailed('Failed to generate timelapse: {0:s}'.format(str(video_file)))
+                video_entry = self._miscDb.addPanoramaVideo(video_file.relative_to(self.image_dir),
+                    camera.id, video_metadata, replace=previous)
+            except Exception:
+                db.session.rollback()
+                raise
+            if previous_path and previous_path != video_file:
+                try:
+                    previous_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning('Could not remove replaced panorama movie %s', previous_path)
+        except (TimelapseException, OSError) as exc:
+            logger.error('Panorama encoding failed: %s', exc)
+            if space_failure(self.config, exc):
+                task.setFailed(DEFERRED)
+                return
+            self._miscDb.addNotification(NotificationCategory.MEDIA, 'timelapse_video',
+                                         'Panorama timelapse failed to generate', expire=timedelta(hours=12))
+            task.setFailed(('Panorama {} {}: {}'.format(timeofday, timespec, exc))[:255])
             return
 
-
-        task.setSuccess('Generated timelapse: {0:s}'.format(str(video_file)))
+        task.setSuccess('Generated panorama timelapse: {}'.format(video_file))
 
         ### Upload ###
         self._miscUpload.syncapi_panorama_video(video_entry, video_metadata)  # syncapi before S3
@@ -1819,17 +1801,7 @@ class VideoWorker(Process):
 
         processing_start = time.time()
 
-        kg = KeogramGenerator(
-            self.config,
-            skip_frames=timelapse_skip_frames,
-        )
-        kg.angle = self.config.get('KEOGRAM_ANGLE', 0.0)
-        kg.h_scale_factor = self.config.get('KEOGRAM_H_SCALE', 100)
-        kg.v_scale_factor = self.config.get('KEOGRAM_V_SCALE', 33)
-        kg.crop_top = self.config.get('KEOGRAM_CROP_TOP', 0)
-        kg.crop_bottom = self.config.get('KEOGRAM_CROP_BOTTOM', 0)
-        kg.label = self.config.get('KEOGRAM_LABEL', True)
-
+        kg = derived_media.make_keogram(self.config, timelapse_skip_frames)
 
         keogram_metadata = {
             'type'       : constants.KEOGRAM,
@@ -1918,96 +1890,9 @@ class VideoWorker(Process):
             startrail_video_entry = None
 
 
-        stg = StarTrailGenerator(
-            self.config,
-            skip_frames=timelapse_skip_frames,
-            mask=detection_mask_dict,
-        )
-        stg.max_adu = self.config['STARTRAILS_MAX_ADU']
-        stg.mask_threshold = self.config['STARTRAILS_MASK_THOLD']
-        stg.pixel_cutoff_threshold = self.config['STARTRAILS_PIXEL_THOLD']
-        stg.min_stars = self.config.get('STARTRAILS_MIN_STARS', 0)
-        stg.latitude = camera.latitude
-        stg.longitude = camera.longitude
-        stg.sun_alt_threshold = self.config['STARTRAILS_SUN_ALT_THOLD']
-
-        if self.config['STARTRAILS_MOONMODE_THOLD']:
-            stg.moonmode_alt = self.config['NIGHT_MOONMODE_ALT_DEG']
-            stg.moonmode_phase = self.config['NIGHT_MOONMODE_PHASE']
-        else:
-            stg.moon_alt_threshold = self.config['STARTRAILS_MOON_ALT_THOLD']
-            stg.moon_phase_threshold = self.config['STARTRAILS_MOON_PHASE_THOLD']
-
-        if self.config.get('STARTRAILS_USE_DB_DATA', True):
-            logger.warning('Re-using image data for ADU and Star counts')
-        else:
-            logger.warning('Recalculating values for ADU and Star counts')
-
-
-        # Files are presorted from the DB
-        for i, entry in enumerate(files_entries):
-            if i % 50 == 0:
-                processing_elapsed_s = time.time() - processing_start
-                logger.info('Processed %d of %d images (%0.2f images/s)', i, image_count, (i + 1) / processing_elapsed_s)
-
-            image_file_p = Path(entry.getFilesystemPath())
-
-            if not image_file_p.exists():
-                logger.error('File not found: %s', image_file_p)
-                continue
-
-            if image_file_p.stat().st_size == 0:
-                continue
-
-
-            #logger.info('Reading file: %s', p_entry)
-            if image_file_p.suffix in ('.jpg', '.jpeg'):
-                import simplejpeg
-
-                try:
-                    with io.open(str(image_file_p), 'rb') as f_img:
-                        image_data = simplejpeg.decode_jpeg(f_img.read(), colorspace='BGR')
-                except ValueError as e:
-                    logger.error('Unable to read image - %s: %s', str(e), image_file_p)
-                    continue
-            elif image_file_p.suffix in ('.png',):
-                # opencv is faster than Pillow with PNG
-                image_data = cv2.imread(str(image_file_p), cv2.IMREAD_COLOR)
-
-                if isinstance(image_data, type(None)):
-                    logger.error('Unable to read %s', image_file_p)
-                    continue
-
-            else:
-                # Pillow supports remaining image types
-                import numpy
-                import PIL
-                from PIL import Image
-
-                try:
-                    with Image.open(str(image_file_p)) as img_pil:
-                        image_data = cv2.cvtColor(numpy.array(img_pil), cv2.COLOR_RGB2BGR)
-                except PIL.UnidentifiedImageError:
-                    logger.error('Unable to read image: %s', image_file_p)
-                    continue
-
-
-            try:
-                image_ts = image_file_p.stat().st_mtime
-                kg.processImage(image_data, image_ts)
-            except KeogramMismatchException as e:
-                logger.error('Error processing keogram image: %s', str(e))
-
-
-            if night:
-                if self.config.get('STARTRAILS_USE_DB_DATA', True):
-                    adu = entry.adu
-                    star_count = entry.stars  # can be None
-                else:
-                    adu, star_count = None, None
-
-                stg.processImage(image_file_p, image_data, entry.binmode, adu=adu, star_count=star_count)
-
+        stg = (derived_media.make_startrails(self.config, timelapse_skip_frames, camera, detection_mask_dict)
+               if night else None)
+        derived_media.process_frames(self.config, files_entries, kg, stg)
 
         kg.finalize(keogram_file, camera)
 
