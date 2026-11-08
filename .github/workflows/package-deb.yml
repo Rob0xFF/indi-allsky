@@ -28,6 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
+      r2_requested: ${{ steps.check.outputs.r2_requested }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
@@ -35,7 +36,10 @@ jobs:
           fetch-depth: 0
       - name: Check for changes since last nightly
         id: check
+        env:
+          R2_REQUESTED: ${{ secrets.CLOUDFLARE_ACCOUNT_ID != '' || secrets.R2_ACCESS_KEY_ID != '' || secrets.R2_SECRET_ACCESS_KEY != '' }}
         run: |
+          echo "r2_requested=$R2_REQUESTED" >> "$GITHUB_OUTPUT"
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             echo "Tag pushed, forcing build."
             echo "should_build=true" >> $GITHUB_OUTPUT
@@ -437,7 +441,7 @@ jobs:
     name: Build & Deploy APT Repo (Cloudflare R2)
     needs: [check-changes, build-deb, publish]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/indi_v') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: needs.check-changes.outputs.r2_requested == 'true' && (startsWith(github.ref, 'refs/tags/indi_v') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     permissions:
       contents: write
     steps:
@@ -459,6 +463,10 @@ jobs:
           R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           R2_BUCKET: ${{ secrets.R2_BUCKET || 'indi-allsky-apt' }}
         run: |
+          if [[ -z "$R2_ACCOUNT_ID" || -z "$AWS_ACCESS_KEY_ID" || -z "$AWS_SECRET_ACCESS_KEY" ]]; then
+            echo "::error::APT deployment requires CLOUDFLARE_ACCOUNT_ID, R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY."
+            exit 1
+          fi
           sudo apt-get update
           sudo apt-get install -y reprepro gnupg jq
 
