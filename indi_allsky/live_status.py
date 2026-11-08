@@ -2,7 +2,28 @@
 import json
 from datetime import timedelta, timezone
 
+from . import constants
 from .archive_health import BLOCKED
+
+
+# The capture supervisor publishes these STATUS values. The sidebar and the
+# live image must describe that same state even when the web server responds.
+CAPTURE_STATES = {
+    constants.STATUS_RUNNING: ('running', 'RUNNING', 'tw:text-success'),
+    constants.STATUS_SLEEPING: ('sleeping', 'SLEEPING', 'tw:text-base-content/60'),
+    constants.STATUS_RELOADING: ('reloading', 'RELOADING', 'tw:text-warning'),
+    constants.STATUS_STARTING: ('starting', 'STARTING', 'tw:text-info'),
+    constants.STATUS_STOPPING: ('stopping', 'STOPPING', 'tw:text-primary'),
+    constants.STATUS_STOPPED: ('stopped', 'STOPPED', 'tw:text-primary'),
+    constants.STATUS_PAUSED: ('paused', 'PAUSED', 'tw:text-base-content/60'),
+    constants.STATUS_NOCAMERA: ('no_camera', 'NO CAMERA', 'tw:text-error'),
+    constants.STATUS_CAMERAERROR: ('camera_error', 'CAMERA ERROR', 'tw:text-error'),
+    constants.STATUS_NOINDISERVER: ('no_indiserver', 'NO INDISERVER', 'tw:text-error'),
+}
+
+
+def station_status(code, label, class_name):
+    return {'code': code, 'label': label, 'class_name': class_name}
 
 
 def capture_time(wall, offset, now):

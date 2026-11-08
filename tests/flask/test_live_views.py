@@ -12,9 +12,10 @@ from zoneinfo import ZoneInfo
 import json
 
 from indi_allsky.archive_health import BLOCKED
-from indi_allsky.live_status import capture_time, health_reason, latest_live_row
+from indi_allsky import constants
+from indi_allsky.live_status import CAPTURE_STATES, capture_time, health_reason, latest_live_row, station_status
 
-from flask import Flask, request
+from flask import Flask, jsonify, request
 import ephem
 import pytest
 
@@ -35,6 +36,8 @@ def latest(tmp_path):
     view_class = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'JsonLatestImageView')
     method_names = ('get_objects', 'setLiveFile', 'get_live_status', 'set_last_permitted_image', 'set_archive_frame')
     methods = [n for n in view_class.body if isinstance(n, ast.FunctionDef) and n.name in method_names]
+    panel_class = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'AjaxStatusUpdateView')
+    methods.append(next(n for n in panel_class.body if isinstance(n, ast.FunctionDef) and n.name == 'dispatch_request'))
     now = datetime(2026, 11, 7, 20)
     class Clock(datetime):
         @classmethod
@@ -46,7 +49,16 @@ def latest(tmp_path):
     misc = ast.parse((path.parent/'misc.py').read_text())
     rule = next(n for n in misc.body if isinstance(n, ast.FunctionDef) and n.name == 'media_access_allowed')
     methods.append(rule)
-    scope = dict(Path=Path, timedelta=timedelta, request=request, datetime=Clock, timezone=timezone, BLOCKED=BLOCKED,
+    base_path = path.parent / 'base_views.py'
+    base = next(n for n in ast.parse(base_path.read_text()).body if isinstance(n, ast.ClassDef) and n.name == 'BaseView')
+    station_methods = ('get_indi_allsky_status', 'render_status_panel', 'get_status_text')
+    methods.extend(n for n in base.body if isinstance(n, ast.FunctionDef) and n.name in station_methods)
+
+    scope = dict(Path=Path, constants=constants, CAPTURE_STATES=CAPTURE_STATES, station_status=station_status,
+                 time=SimpleNamespace(time=lambda: now.timestamp()),
+                 psutil=SimpleNamespace(boot_time=lambda: now.timestamp() - 10),
+                 archive_state=lambda cfg: {}, ups_problem=lambda path: False, timedelta=timedelta,
+                 request=request, jsonify=jsonify, datetime=Clock, timezone=timezone, BLOCKED=BLOCKED,
                  camera_timezone=lambda camera: camera_zone, capture_time=capture_time, health_reason=health_reason, current_user=user)
     exec(compile(ast.Module(body=methods, type_ignores=[]), str(path), 'exec'), scope)
     view = SimpleNamespace(history_seconds=900, indi_allsky_config={'IMAGE_FOLDER': str(tmp_path), 'IMAGE_FILE_TYPE': 'jpg'},
@@ -64,6 +76,12 @@ def latest(tmp_path):
         'DB_CAMERA_ID': SimpleNamespace(value='3', createDate=now-timedelta(days=1)),
         'CAPTURE_HEALTH': SimpleNamespace(value=json.dumps({'updated':int(now.timestamp()), 'stage':'idle'}), createDate=now)
     }
+    view.live_states['WATCHDOG'] = SimpleNamespace(value=str(int(now.timestamp())))
+    view.live_states['STATUS'] = SimpleNamespace(value=str(constants.STATUS_RUNNING))
+    view.get_camera_info = lambda: {'camera_name':'Fixture'}
+    view.get_astrometric_info = view.get_smoke_info = view.get_aurora_info = view.get_image_data = lambda: {}
+    view.getUptime = lambda: 'fixture uptime'
+    view.get_web_extra_text = lambda: '<div>Extra text</div>'
     calls = []
 
     def get_image(camera_id, history_seconds, not_after=None, live_now=None):
@@ -72,7 +90,7 @@ def latest(tmp_path):
                 'create_date': now - timedelta(hours=2), 'id': 17, 'utc_offset': None}
 
     view.getLatestImage = get_image
-    for name in method_names[1:]:
+    for name in (*method_names[1:], *station_methods):
         setattr(view, name, scope[name].__get__(view))
     file = tmp_path / 'latest.jpg'
     file.write_bytes(b'test')
@@ -81,7 +99,8 @@ def latest(tmp_path):
 
     app = Flask(__name__)
     scope.update(app=app)
-    app.add_url_rule('/latest', view_func=lambda: scope['get_objects'](view))
+    app.add_url_rule('/latest', 'latest', view_func=lambda: scope['get_objects'](view))
+    app.add_url_rule('/panel', 'panel', view_func=lambda: scope['dispatch_request'](view))
     return app.test_client(), view, file, calls
 
 
@@ -265,3 +284,46 @@ def test_anonymous_live_view_respects_archive_auth_while_authenticated_can_open_
     get = view.getLatestImage
     view.getLatestImage = lambda *a, **kw: {**get(*a, **kw), 'create_date':view.camera_now-timedelta(seconds=20)}
     assert client.get(url).get_json()['latest_image']['frame_key'] == '3:17'
+
+@pytest.mark.parametrize(('published','code','label'), [
+    (constants.STATUS_RUNNING, 'running', 'RUNNING'),
+    (constants.STATUS_NOINDISERVER, 'no_indiserver', 'NO INDISERVER'),
+    (constants.STATUS_STOPPED, 'stopped', 'STOPPED'),
+    (constants.STATUS_CAMERAERROR, 'camera_error', 'CAMERA ERROR'),
+])
+def test_panel_and_image_share_the_station_status_even_with_a_fresh_frame(latest, published, code, label):
+    client, view, _, _ = latest
+    view.indi_allsky_config['WEB_STATUS_TEMPLATE'] = '{camera_name}: {status}'
+    view.live_states['STATUS'].value = str(published)
+    endpoint = '/latest?camera_id=3&live_status=1&night=0'
+    fast = client.get(endpoint).get_json()
+    assert fast['latest_image']['url'] and fast['live_status']['reason'] is None
+    assert fast['live_status']['station']['code'] == code
+    assert 'status_text' not in fast
+    full = client.get(endpoint + '&status_details=1').get_json()
+    assert client.get('/panel?camera_id=3').get_json()['status_text'] == full['status_text']
+    station = full['live_status']['station']
+    assert station == fast['live_status']['station']
+    assert full['status_text'] == (
+        '<div>Fixture: <span data-station-state class="{}">{}</span></div><div>Extra text</div>'
+        .format(station['class_name'], label)
+    )
+
+
+def test_panel_details_are_opt_in_and_use_a_single_station_snapshot(latest):
+    from unittest.mock import Mock
+    client, view, _, _ = latest
+    view.get_indi_allsky_status = Mock(wraps=view.get_indi_allsky_status)
+    view.get_astrometric_info = Mock(return_value={})
+    endpoint = '/latest?camera_id=3&night=0'
+    assert 'live_status' not in client.get(endpoint + '&status_details=1').get_json()
+    view.get_indi_allsky_status.assert_not_called()
+    client.get(endpoint + '&live_status=1')
+    view.get_indi_allsky_status.assert_called_once_with(notify=False)
+    view.get_astrometric_info.assert_not_called()
+    view.get_indi_allsky_status.reset_mock()
+    view.indi_allsky_config['WEB_STATUS_TEMPLATE'] = 'Camera {camera_name}'
+    full = client.get(endpoint + '&live_status=1&status_details=1').get_json()
+    assert full['status_text'] == '<div>Camera Fixture</div><div>Extra text</div>'
+    view.get_indi_allsky_status.assert_called_once_with(notify=True)
+    view.get_astrometric_info.assert_called_once()

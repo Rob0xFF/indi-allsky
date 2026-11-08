@@ -252,41 +252,9 @@ class AjaxStatusUpdateView(BaseView):
     methods = ['GET']
 
     def dispatch_request(self):
-        camera_id = int(request.args['camera_id'])
-
-
-        self.cameraSetup(camera_id=camera_id)
-
-        # query the latest image entry
-        camera_now_minus_15m = self.camera_now - timedelta(minutes=15)
-        self.latest_image_entry = db.session.query(
-            IndiAllSkyDbImageTable,
-        )\
-            .join(IndiAllSkyDbImageTable.camera)\
-            .filter(IndiAllSkyDbCameraTable.id == self.camera.id)\
-            .filter(IndiAllSkyDbImageTable.createDate > camera_now_minus_15m)\
-            .order_by(IndiAllSkyDbImageTable.createDate.desc())\
-            .first()
-
-
-        status_data = dict()
-        status_data.update(self.get_indi_allsky_status())
-        status_data.update(self.get_camera_info())
-        status_data.update(self.get_astrometric_info())
-        status_data.update(self.get_smoke_info())
-        status_data.update(self.get_aurora_info())
-        status_data.update(self.get_image_data())
-
-
-        status_data['uptime'] = int(time.time() - psutil.boot_time())
-        status_data['uptime_str'] = self.getUptime()
-
-
-        data = {
-            'status_text' : self.get_status_text(status_data) + self.get_web_extra_text(),
-        }
-
-        return jsonify(data)
+        self.cameraSetup(camera_id=int(request.args['camera_id']))
+        station = self.get_indi_allsky_status()
+        return jsonify(status_text=self.render_status_panel(station))
 
 
 class IndexCanvasView(TemplateView):
@@ -363,6 +331,11 @@ class JsonLatestImageView(JsonView):
                 if history_allowed and reason in ('paused', 'daytime_disabled', 'daytime_unsaved_remote', 'local_file_restricted'):
                     self.set_last_permitted_image(entry, now, history_seconds)
                 data['live_status'] = self.get_live_status(entry, now, night, reason)
+                include_details = request.args.get('status_details') == '1'
+                station = self.get_indi_allsky_status(notify=include_details)
+                data['live_status']['station'] = station
+                if include_details:
+                    data['status_text'] = self.render_status_panel(station)
             return data
 
         if live and self.camera.id < 1:
@@ -472,11 +445,6 @@ class JsonLatestImageView(JsonView):
             status['reason'] = issue or status['reason']
         return status
 
-
-    @cached_property
-    def live_states(self):
-        return {row.key: row for row in IndiAllSkyDbStateTable.query.filter(
-            IndiAllSkyDbStateTable.key.in_(('DB_CAMERA_ID', 'CAPTURE_HEALTH')))}
 
     @cached_property
     def live_archive_state(self):

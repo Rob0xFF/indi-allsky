@@ -34,12 +34,30 @@ function browser(view, {sidebar = view !== 'companion', livePath = 'latest'} = {
             if (key === 'canvas' && this.id === 'live-view') return view === 'canvas' ? el('canvas') : null;
             return el(this.id + key);
         }
+        querySelectorAll(selector) {
+            return selector === '[data-station-state]' ? this.options : [];
+        }
+        set innerHTML(markup) {
+            this.markup = markup;
+            if (this.id === 'status_text') {
+                this.options = Array.from(markup.matchAll(/<span data-station-state[^>]*>([^<]*)<\/span>/g), match => {
+                    const marker = new Element('station');
+                    marker.textContent = match[1];
+                    return marker;
+                });
+            }
+        }
+        get innerHTML() { return this.markup; }
+        after(node) { this.nextElementSibling = node; node.parentElement = this; }
         replaceWith(other) {
             elements.set(this.id, other);
             displays.push(other.src);
         }
         replaceChildren(...children) { this.options = children; }
-        append(...children) { this.options.push(...children); }
+        append(...children) {
+            this.options.push(...children);
+            for (const child of children) if (child instanceof Element) child.parentElement = this;
+        }
         removeAttribute(key) { delete this[key]; }
     }
     function el(id) {
@@ -49,10 +67,11 @@ function browser(view, {sidebar = view !== 'companion', livePath = 'latest'} = {
     el('companion').dataset = {cameraId: '3', refreshMs: '30000', staleMs: '90000', endpoint: '/indi-allsky/js/companion?camera_id=3'};
     el('live-view').dataset = {interval: '31000', endpoint: '/indi-allsky/js/' + livePath + '?camera_id=3&night=auto'};
     if (sidebar) el('sidebar-live-status').dataset = {endpoint: '/indi-allsky/js/latest?camera_id=3&night=auto'};
+    el('status_text').innerHTML = '<div>Status: <span data-station-state>RUNNING</span></div>';
     function byId(id) {
         if (id === 'live-view' && view === 'sidebar') return null;
         if (['message', 'live-age', 'live-time', 'live-server', 'live-status'].includes(id)) return null;
-        if (!sidebar && ['sidebar-live-status', 'sidebar-live-detail', 'live-retry', 'live-login', 'live-services', 'live-settings'].includes(id)) return null;
+        if (!sidebar && ['sidebar-live-status', 'sidebar-live-detail', 'sidebar-image-age', 'sidebar-status-fallback', 'sidebar-station-fallback', 'status_text', 'live-retry', 'live-login', 'live-services', 'live-settings'].includes(id)) return null;
         return el(id);
     }
     const document = {baseURI: 'https://camera.test/indi-allsky/', hidden: false, addEventListener: listen,
@@ -103,7 +122,8 @@ function browser(view, {sidebar = view !== 'companion', livePath = 'latest'} = {
     return {el, advance, requests, images, displays, draws, flush, emit, document, timers};
 }
 
-const latest = filename => ({latest_image: {url: filename, message: ''}});
+const running = {code:'running', label:'RUNNING', class_name:'tw:text-success'};
+const latest = filename => ({latest_image: {url: filename, message: ''}, live_status:{station:running}});
 const frame = (id = 0) => ({url: 'images/' + id + '.jpg', captured_at: '2026-11-07T21:00:0' + id + '+01:00', time_source: 'capture'});
 const status = image => ({image, now: '2026-11-07T21:00:10+01:00', time_zone: 'Europe/Berlin', offset_minutes: 60});
 const full = image => ({...status(image), astronomy: {moon_phase: 'New Moon', moon_illumination: 0}, metrics: [], defaults: [], series: []});
@@ -113,14 +133,14 @@ for (const view of ['image', 'canvas']) {
         const b = browser(view);
         b.requests[0].reply('<html>login</html>', 'text/html', 200, true);
         await b.flush();
-        assert.match(b.el('sidebar-live-status').textContent, /sign-in required/);
+        assert.equal(b.el('sidebar-station-fallback').textContent, 'SIGN IN REQUIRED');
         assert.equal(b.el('live-login').hidden, false);
         await b.advance(5000);
         b.requests[1].reply(latest('images/ok.jpg')); await b.flush();
         assert.equal(b.images.length, 1);
         b.images[0].onload();
         assert.deepEqual(view === 'canvas' ? b.draws : b.displays, ['images/ok.jpg']);
-        assert.match(b.el('sidebar-live-status').textContent, /camera server reachable/);
+        assert.match(b.el('sidebar-image-age').title, /RUNNING.*web server reachable/);
         assert.equal(b.el('live-login').hidden, true);
         assert.equal(b.requests[1].options.cache, 'no-store');
     });
@@ -128,13 +148,13 @@ for (const view of ['image', 'canvas']) {
 
 const detailed = (url, capturedAt, reason = null, now = '2026-11-08T03:05:00+01:00') => ({
     latest_image: {url, message: '', captured_at: capturedAt, frame_key: capturedAt, time_source: 'capture'},
-    live_status: {now, stale_after_s: 90, reason, can_manage: false},
+    live_status: {now, stale_after_s: 90, reason, can_manage: false, station:running},
 });
 
 for (const view of ['image', 'canvas']) {
     test(view + ': age and camera time describe only the displayed frame, including while offline', async () => {
         const b = browser(view);
-        const indicator = b.el('sidebar-live-status');
+        const indicator = b.el('sidebar-image-age');
         assert.equal(b.requests.length, 1);
         assert.equal(b.requests[0].url.searchParams.get('live_status'), '1');
         const first = detailed('first', '2026-11-08T03:02:00+01:00');
@@ -142,7 +162,7 @@ for (const view of ['image', 'canvas']) {
         assert.match(indicator.textContent, /^Waiting for image/);
         b.images[0].onload();
         assert.match(indicator.textContent, /^Last image 3 min ago/);
-        assert.match(indicator.title, /camera server reachable/);
+        assert.match(indicator.title, /RUNNING.*web server reachable/);
         assert.match(indicator.title, /2026-11-08 03:02:00 UTC\+01:00/);
         await b.advance(5000);
         const next = detailed('next', first.live_status.now, null, '2026-11-08T03:05:05+01:00');
@@ -151,17 +171,17 @@ for (const view of ['image', 'canvas']) {
         assert.doesNotMatch(indicator.title, /03:05:00 UTC\+01:00/);
         b.images[1].onload();
         assert.match(indicator.title, /03:05:00 UTC\+01:00/);
-        assert.equal(indicator.textContent, 'Last image 5 s ago · camera server reachable');
+        assert.equal(indicator.textContent, 'Last image 5 s ago');
         await b.advance(5000); b.requests[2].fail(); await b.flush();
         await b.advance(1000);
-        assert.equal(indicator.textContent, 'Last image 11 s ago · server offline');
-        assert.match(indicator.title, /camera server unreachable/);
+        assert.equal(indicator.textContent, 'Last image 11 s ago');
+        assert.match(indicator.title, /CONNECTION LOST.*web server unreachable/);
         assert.equal(b.el('live-retry').hidden, false);
         b.el('live-retry').click();
         b.requests[3].reply(detailed('next', next.latest_image.captured_at, 'processing', '2026-11-08T03:05:11+01:00'));
         await b.flush();
         assert.equal(b.images.length, 2);
-        assert.equal(indicator.textContent, 'Last image 11 s ago · camera server reachable');
+        assert.equal(indicator.textContent, 'Last image 11 s ago');
         assert.equal(b.el('live-retry').hidden, true);
     });
 
@@ -176,6 +196,79 @@ for (const view of ['image', 'canvas']) {
     });
 }
 
+test('one poll updates the configured station status and frame age through an INDI outage and reconnection', async () => {
+    const b = browser('sidebar');
+    const at = '2026-11-08T03:04:57+01:00';
+    const stop = {code:'no_indiserver', label:'NO INDISERVER', class_name:'tw:text-error'};
+    const snapshot = (station, full = false) => {
+        const payload = detailed('camera.jpg', at);
+        payload.live_status.station = station;
+        payload.live_status.can_manage = true;
+        if (full) payload.status_text = '<div>Status: <span data-station-state>' + station.label + '</span></div>' +
+            '<div>Battery 100%</div><div>Also <span data-station-state>' + station.label + '</span></div>';
+        return payload;
+    };
+    const refresh = async () => { await b.advance(15000); return b.requests.at(-1); };
+    assert.equal(b.requests.length, 1);
+    assert.equal(b.requests[0].url.searchParams.get('status_details'), '1');
+    b.requests[0].reply(snapshot(running, true)); await b.flush();
+    const template = b.el('status_text'), age = b.el('sidebar-image-age');
+    const first = template.options[0], second = template.options[1];
+    assert.equal(first.nextElementSibling, age);
+    assert.equal(second.nextElementSibling, undefined);
+    assert.equal(b.el('sidebar-status-fallback').hidden, true);
+    assert.match(template.innerHTML, /Battery 100%/);
+
+    const next = await refresh();
+    assert.equal(next.url.searchParams.has('status_details'), false);
+    next.reply(snapshot(stop)); await b.flush();
+    assert.equal(first.textContent, 'NO INDISERVER');
+    assert.equal(second.textContent, 'NO INDISERVER');
+    assert.equal(first.className, 'tw:text-error');
+    assert.equal(age.textContent, 'Last image 3 s ago');
+    assert.equal(b.el('sidebar-live-status').dataset.state, 'warning');
+    assert.match(b.el('sidebar-live-detail').textContent, /cannot reach the INDI server/);
+    assert.equal(b.el('live-retry').hidden, true);
+    assert.equal(b.el('live-services').hidden, false);
+    assert.match(age.title, /NO INDISERVER.*web server reachable/);
+
+    (await refresh()).fail(); await b.flush();
+    assert.equal(template.hidden, true);
+    assert.equal(b.el('sidebar-status-fallback').hidden, false);
+    assert.equal(b.el('sidebar-station-fallback').textContent, 'CONNECTION LOST');
+    assert.equal(age.parentElement, b.el('sidebar-status-fallback'));
+    b.el('live-retry').click();
+    assert.equal(b.requests.at(-1).url.searchParams.get('status_details'), '1');
+    b.requests.at(-1).reply(snapshot(running, true)); await b.flush();
+    assert.equal(template.hidden, false);
+    assert.equal(b.el('sidebar-status-fallback').hidden, true);
+    assert.equal(template.options[0].textContent, 'RUNNING');
+    assert.equal(template.options[0].className, 'tw:text-success');
+    assert.equal(template.options[0].nextElementSibling, age);
+    assert.deepEqual(b.images, []);
+});
+
+test('custom status templates without a station placeholder keep their content and get one fallback status', async () => {
+    const b = browser('sidebar'), payload = detailed(null, null);
+    payload.live_status.station = {code:'stopped', label:'STOPPED', class_name:'tw:text-primary'};
+    payload.status_text = '<div><b>Battery:</b> 100%</div>';
+    b.requests[0].reply(payload); await b.flush();
+    assert.equal(b.el('status_text').innerHTML, payload.status_text);
+    assert.equal(b.el('status_text').hidden, false);
+    assert.equal(b.el('sidebar-status-fallback').hidden, false);
+    assert.equal(b.el('sidebar-station-fallback').textContent, 'STOPPED');
+    assert.equal(b.el('sidebar-image-age').parentElement, b.el('sidebar-status-fallback'));
+    assert.equal(b.el('live-retry').hidden, true);
+    delete payload.status_text;
+    for (let i = 0; i < 4; i++) {
+        await b.advance(15000);
+        assert.equal(b.requests.at(-1).url.searchParams.has('status_details'), i === 3);
+        b.requests.at(-1).reply(payload); await b.flush();
+    }
+    assert.equal(b.requests.length, 5);
+    assert.equal(b.el('status_text').innerHTML, '<div><b>Battery:</b> 100%</div>');
+});
+
 test('specific remedies require a current authorization, and deliberate pauses are never retried manually', async () => {
     const b = browser('sidebar');
     const pause = detailed(null, null, 'paused');
@@ -183,12 +276,12 @@ test('specific remedies require a current authorization, and deliberate pauses a
         b.emit('online'); b.requests.at(-1).reply(data); await b.flush();
     };
     b.requests[0].reply(pause); await b.flush();
-    assert.match(b.el('sidebar-live-status').title, /Capture is paused/);
+    assert.match(b.el('sidebar-image-age').title, /Capture is paused/);
     assert.equal(b.el('sidebar-live-detail').textContent, 'Capture is paused.');
     assert.equal(b.el('live-settings').hidden, true);
     assert.equal(b.el('live-retry').hidden, true);
-    assert.match(b.el('sidebar-live-status').textContent, /capture paused/);
-    assert.doesNotMatch(b.el('sidebar-live-status').textContent, /settings/i);
+    assert.match(b.el('sidebar-image-age').textContent, /capture paused/);
+    assert.doesNotMatch(b.el('sidebar-image-age').textContent, /settings/i);
     pause.live_status.can_sign_in_to_manage = true;
     await update(pause);
     assert.equal(b.el('live-login').hidden, false);
@@ -201,7 +294,7 @@ test('specific remedies require a current authorization, and deliberate pauses a
     await update(pause);
     assert.equal(b.el('live-settings').hidden, true);
     assert.equal(b.el('live-services').hidden, false);
-    assert.match(b.el('sidebar-live-status').title, /write access/);
+    assert.match(b.el('sidebar-image-age').title, /write access/);
     assert.match(b.el('sidebar-live-detail').textContent, /write access/);
     b.emit('online'); b.requests.at(-1).reply({}, 'application/json', 403);
     await b.flush();
@@ -220,13 +313,13 @@ test('ambiguous camera timestamps do not inherit the timestamp or age of the pre
     const entry = detailed('ambiguous', null);
     entry.latest_image.frame_key = 'image:2';
     await b.advance(5000); b.requests[1].reply(entry); await b.flush(); b.images[1].onload();
-    assert.doesNotMatch(b.el('sidebar-live-status').title, /03:04:59/);
-    assert.match(b.el('sidebar-live-status').textContent, /^Image time unknown/);
+    assert.doesNotMatch(b.el('sidebar-image-age').title, /03:04:59/);
+    assert.match(b.el('sidebar-image-age').textContent, /^Image time unknown/);
 });
 
 test('the sidebar tooltip identifies file times and distinguishes the repeated local hour', async () => {
     const b = browser('image');
-    const indicator = b.el('sidebar-live-status');
+    const indicator = b.el('sidebar-image-age');
     for (const [index, offset] of ['+02:00', '+01:00'].entries()) {
         if (index) await b.advance(5000);
         const entry = detailed('file-' + index, '2026-10-25T02:15:00' + offset,
@@ -235,7 +328,7 @@ test('the sidebar tooltip identifies file times and distinguishes the repeated l
         b.requests[index].reply(entry);
         await b.flush();
         b.images[index].onload();
-        assert.equal(indicator.textContent, 'Last image 2 s ago · camera server reachable');
+        assert.equal(indicator.textContent, 'Last image 2 s ago');
         assert.ok(indicator.title.includes('File time 2026-10-25 02:15:00 UTC' + offset));
         assert.equal(b.el('sidebar-live-detail').textContent, '');
     }
@@ -246,7 +339,7 @@ test('a clock correction never turns a genuinely future displayed timestamp into
     const captured = '2026-11-08T03:05:01+01:00';
     b.requests[0].reply(detailed('shown.jpg', captured));
     await b.flush(); b.images[0].onload();
-    const indicator = b.el('sidebar-live-status');
+    const indicator = b.el('sidebar-image-age');
     assert.match(indicator.textContent, /^Last image 0 s ago/);
     await b.advance(5000);
     b.requests[1].reply(detailed(null, null, 'no_recent_image', '2026-11-08T02:55:05+01:00'));
@@ -254,11 +347,11 @@ test('a clock correction never turns a genuinely future displayed timestamp into
     assert.match(indicator.title, /03:05:01 UTC\+01:00/);
     assert.match(indicator.title, /Check the camera time and time zone/);
     assert.equal(b.el('live-retry').hidden, false);
-    assert.equal(b.el('sidebar-live-status').textContent, 'Image time ahead of camera · check clock');
+    assert.equal(b.el('sidebar-image-age').textContent, 'Image time ahead of camera · check clock');
     b.el('live-retry').click();
     b.requests[2].reply(detailed('new-frame.jpg', '2026-11-08T02:55:05+01:00', null, '2026-11-08T02:55:08+01:00'));
     await b.flush(); b.images[1].onload();
-    assert.equal(indicator.textContent, 'Last image 3 s ago · camera server reachable');
+    assert.equal(indicator.textContent, 'Last image 3 s ago');
     assert.equal(b.el('live-retry').hidden, true);
 });
 
@@ -266,10 +359,10 @@ test('on other pages the sidebar polls JSON at a low rate without downloading im
     const b = browser('sidebar', {sidebar: true});
     b.requests[0].reply(detailed('not-fetched', '2026-11-08T03:04:57+01:00'));
     await b.flush();
-    assert.equal(b.el('sidebar-live-status').textContent, 'Last image 3 s ago · camera server reachable');
+    assert.equal(b.el('sidebar-image-age').textContent, 'Last image 3 s ago');
     await b.advance(12000);
     assert.equal(b.requests.length, 1);
-    assert.equal(b.el('sidebar-live-status').textContent, 'Last image 15 s ago · camera server reachable');
+    assert.equal(b.el('sidebar-image-age').textContent, 'Last image 15 s ago');
     await b.advance(3000);
     assert.equal(b.requests.length, 2);
     assert.equal(b.images.length, 0);
@@ -291,8 +384,8 @@ test('panorama polls and sidebar capture polls remain independent', async () => 
     b.requests[1].reply(detailed('normal.jpg', '2026-11-08T03:04:51+01:00', 'capture_recovering'));
     await b.flush();
     b.images[0].onload();
-    assert.equal(b.el('sidebar-live-status').textContent, 'Last image 9 s ago · recovering capture');
-    assert.doesNotMatch(b.el('sidebar-live-status').title, /03:01:00/);
+    assert.equal(b.el('sidebar-image-age').textContent, 'Last image 9 s ago · recovering capture');
+    assert.doesNotMatch(b.el('sidebar-image-age').title, /03:01:00/);
     assert.deepEqual(b.draws, ['panorama.jpg']);
     assert.equal(b.images.length, 1);
 });
@@ -308,7 +401,7 @@ test('a slow completed frame displays before the newest queued frame; a failed i
     assert.equal(b.images[1].src, 'newest');
     b.images[1].onerror();
     assert.deepEqual(b.displays, ['first']);
-    assert.match(b.el('sidebar-live-status').title, /could not be loaded/i);
+    assert.match(b.el('sidebar-image-age').title, /could not be loaded/i);
     await b.advance(5000); b.requests[3].reply(latest('newest')); await b.flush();
     b.images[2].onload(); assert.deepEqual(b.displays, ['first', 'newest']);
 });
@@ -339,7 +432,7 @@ test('a hanging JPEG times out and the same key becomes retriable', async () => 
         assert.equal(b.images.length, 1);
     }
     await b.advance(5000);
-    assert.match(b.el('sidebar-live-status').title, /timed out/);
+    assert.match(b.el('sidebar-image-age').title, /timed out/);
     b.requests[6].reply(latest('unchanged')); await b.flush();
     assert.equal(b.images.length, 2);
     b.images[1].onload(); assert.deepEqual(b.displays, ['unchanged']);

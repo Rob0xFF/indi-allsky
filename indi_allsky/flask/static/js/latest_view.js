@@ -29,6 +29,22 @@
         focus_waiting: ['waiting for focus', 'Waiting for a focus image.', 'retry'],
     };
     const delayedReasons = new Set(['processing', 'awaiting_frame', 'no_recent_image', 'capture_status_stale', 'focus_waiting']);
+    // A successful HTTP response doesn't tell us whether acquisition is running.
+    const stationIssues = {
+        no_indiserver: ['The capture service cannot reach the INDI server.', 'services'],
+        no_camera: ['The capture service could not find a camera.', 'services'],
+        camera_error: ['The capture service reports a camera error.', 'services'],
+        stopped: ['The capture service is stopped.', 'services'],
+        stopping: ['The capture service is stopping.'],
+        down: ['The capture service has not updated its watchdog.', 'services'],
+        paused: ['Capture is paused.', 'settings'],
+        inactive: ['Another local camera is selected for capture.'],
+        unknown: ['The station has not reported a known capture state.', 'services'],
+    };
+    const requestLabels = {
+        login: 'SIGN IN REQUIRED', forbidden: 'ACCESS DENIED', timeout: 'WEB TIMEOUT',
+        network: 'CONNECTION LOST', invalid: 'STATUS UNAVAILABLE', server: 'WEB ERROR',
+    };
     const requestErrors = {
         login: ['sign-in required', 'Sign in to resume live images.', 'login'],
         forbidden: ['access restricted', 'Access to live images is restricted.'],
@@ -60,8 +76,15 @@
         let clock = null;
         let online = null;
         let requestError = null;
+        let requestIssue = '';
         let transferError = null;
         let legacyMessage = '';
+        let nextDetailsAt = 0;
+        const statusText = indicator && byId('status_text');
+        const ageLink = indicator && byId('sidebar-image-age');
+        const fallback = indicator && byId('sidebar-status-fallback');
+        let lastMarkup = null;
+        let haveDetails = true; // The template renders the first status report.
 
         function render() {
             if (!indicator || document.hidden) return;
@@ -72,11 +95,14 @@
             let age = shown ? 'Image time unknown' : 'Waiting for image';
             if (ahead) age = 'Image time ahead of camera';
             else if (seconds !== null) age = 'Last image ' + ageText(seconds) + ' ago';
-            const server = online === true ? 'camera server reachable'
-                : online === false ? 'camera server unreachable' : 'checking camera server';
+            const server = online === true ? 'web server reachable'
+                : online === false ? 'web server unreachable' : 'checking web connection';
+            const station = !requestError && report.station;
+            const stationIssue = station && stationIssues[station.code];
             const late = seconds !== null && seconds >= (report.stale_after_s || 90);
             const delayed = !shown || seconds === null || late || ahead;
             let notice = requestError || transferError;
+            if (!notice && stationIssue) notice = ['', ...stationIssue];
             if (!notice && ahead && (!report.reason || delayedReasons.has(report.reason))) {
                 notice = ['check clock', 'The displayed image is dated later than the camera clock. Check the camera time and time zone.', 'retry'];
             }
@@ -86,12 +112,34 @@
                 notice = ['loading image', 'New frame available · loading image…'];
             }
             if (!notice && late) notice = ['waiting for image', 'Waiting for a newer image. Checking automatically.', 'retry'];
-            const [summary, detail, action] = notice || ['', '', null];
+            const [summary, note, action] = notice || ['', '', null];
+            const detail = stationIssue && transferError && !requestError
+                ? stationIssue[0] + ' ' + note : note;
             const adminAction = action === 'settings' || action === 'services';
-            const text = age + ' · ' + (summary || server);
-            if (indicator.textContent !== text) indicator.textContent = text;
-            indicator.dataset.state = online === null ? 'checking' : online === false ? 'offline' : detail ? 'warning' : 'ok';
-            indicator.title = [age, server, cameraTime(shown), detail].filter(Boolean).join(' · ');
+
+            // Place the *same* age link alongside the value(s) of {status} in
+            // the configured template. Some templates omit that placeholder.
+            const markers = !station || !haveDetails ? [] : statusText.querySelectorAll('[data-station-state]');
+            const label = station?.label || requestLabels[requestIssue] ||
+                (online === null ? 'CHECKING' : 'STATUS UNAVAILABLE');
+            const tone = station?.class_name || 'tw:text-warning';
+            statusText.hidden = !station || !haveDetails;
+            fallback.hidden = markers.length > 0;
+            const stateNodes = markers.length ? markers : [byId('sidebar-station-fallback')];
+            for (const node of stateNodes) {
+                if (node.textContent !== label) node.textContent = label;
+                if (node.className !== tone) node.className = tone;
+            }
+            if (markers.length) {
+                if (markers[0].nextElementSibling !== ageLink) markers[0].after(ageLink);
+            } else if (ageLink.parentElement !== fallback) {
+                fallback.append(ageLink);
+            }
+            const text = !requestError && summary ? age + ' · ' + summary : age;
+            if (ageLink.textContent !== text) ageLink.textContent = text;
+            ageLink.title = [label, age, server, cameraTime(shown), detail].filter(Boolean).join(' · ');
+            indicator.dataset.state = online === null ? 'checking' : online === false ? 'offline'
+                : !station || detail ? 'warning' : station.code === 'running' ? 'ok' : 'neutral';
 
             const message = byId('sidebar-live-detail');
             if (message.textContent !== detail) message.textContent = detail;
@@ -133,16 +181,34 @@
         const url = new URL(endpoint, document.baseURI);
         url.searchParams.set('live_status', '1');
         const interval = view ? Math.max(2000, Math.min(5000, Number(view.dataset.interval))) : 15000;
-        const poll = new LiveJsonPoll(() => url, interval, payload => {
+        const poll = new LiveJsonPoll(() => {
+            if (indicator && performance.now() >= nextDetailsAt) {
+                url.searchParams.set('status_details', '1');
+                nextDetailsAt = performance.now() + 60000;
+            } else {
+                url.searchParams.delete('status_details');
+            }
+            return url;
+        }, interval, payload => {
             const entry = payload?.latest_image;
             if (!entry || typeof entry.message !== 'string' || !(entry.url === null || typeof entry.url === 'string')) {
                 throw new Error('Invalid latest image');
             }
             report = payload.live_status || {};
+            if (indicator && typeof payload.status_text === 'string') {
+                if (payload.status_text !== lastMarkup) {
+                    // Custom templates may contain trusted HTML and legacy Bootstrap colors.
+                    statusText.innerHTML = payload.status_text.replace(/class="text-success"/g, 'class="tw:text-success"')
+                        .replace(/class="text-(danger|error)"/g, 'class="tw:text-error"');
+                    lastMarkup = payload.status_text;
+                }
+                haveDetails = true;
+            }
             const time = Date.parse(report.now);
             if (Number.isFinite(time)) clock = {time, syncedAt: performance.now()};
             online = true;
             requestError = null;
+            requestIssue = '';
             // Older servers use line breaks and a warning div in their daytime status.
             legacyMessage = report.reason ? '' : entry.message.replace(/<br\s*\/?\s*>|<\/?div\b[^>]*>/gi, ' ').trim();
             if (!frames) {
@@ -159,6 +225,9 @@
         }, (issue, code) => {
             online = issue !== 'network' && issue !== 'timeout';
             requestError = requestErrors[issue] || ['image service error', 'Image service error (HTTP ' + code + '). Retrying…', 'retry'];
+            requestIssue = issue;
+            haveDetails = false;
+            nextDetailsAt = 0; // Recover the entire status panel after reconnection.
             render();
         });
 
