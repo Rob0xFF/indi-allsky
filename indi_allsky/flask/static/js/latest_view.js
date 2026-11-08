@@ -6,7 +6,7 @@
     const sidebar = byId('sidebar-live-status');
     if (!page && !sidebar?.dataset.endpoint) return;
 
-    // Keep sidebar summaries short. Details and available actions belong to the live view.
+    // Keep the summary short; the status section also provides the appropriate recovery action.
     const reasons = {
         no_camera: ['no camera', 'No camera selected.'],
         paused: ['capture paused', 'Capture is paused.', 'settings'],
@@ -45,21 +45,11 @@
         return days + (days === 1 ? ' day' : ' days');
     }
 
-    function displayTime(entry) {
-        const time = byId('live-time');
-        const iso = entry.captured_at;
-        const parts = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(iso || '');
-        time.hidden = !parts;
-        if (!parts) {
-            time.removeAttribute('datetime');
-            time.textContent = '';
-            time.removeAttribute('title');
-            return;
-        }
+    function cameraTime(entry) {
+        const parts = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(entry?.captured_at || '');
+        if (!parts) return '';
         const offset = parts[3] === 'Z' ? 'UTC' : 'UTC' + parts[3];
-        time.dateTime = iso;
-        time.title = entry.time_source === 'file' ? 'Image file time' : 'Camera capture time';
-        time.textContent = (entry.time_source === 'file' ? 'File time ' : '') + parts[1] + ' ' + parts[2] + ' ' + offset;
+        return (entry.time_source === 'file' ? 'File time ' : '') + parts[1] + ' ' + parts[2] + ' ' + offset;
     }
 
     function follow(view, indicator, endpoint) {
@@ -74,7 +64,7 @@
         let legacyMessage = '';
 
         function render() {
-            if (document.hidden) return;
+            if (!indicator || document.hidden) return;
             const taken = Date.parse(shown?.captured_at);
             const elapsed = clock ? clock.time + performance.now() - clock.syncedAt - taken : NaN;
             const seconds = Number.isFinite(elapsed) ? Math.max(0, Math.floor(elapsed / 1000)) : null;
@@ -98,24 +88,18 @@
             if (!notice && late) notice = ['waiting for image', 'Waiting for a newer image. Checking automatically.', 'retry'];
             const [summary, detail, action] = notice || ['', '', null];
             const adminAction = action === 'settings' || action === 'services';
-            if (view) {
-                const ageNode = byId('live-age'), serverNode = byId('live-server');
-                if (ageNode.textContent !== age) ageNode.textContent = age;
-                if (serverNode.textContent !== server) serverNode.textContent = server;
-                const message = byId('message');
-                if (message.textContent !== detail) message.textContent = detail;
-                byId('live-login').hidden = !(action === 'login' || (adminAction && report.can_sign_in_to_manage === true));
-                byId('live-retry').hidden = action !== 'retry';
-                const settings = byId('live-settings'), services = byId('live-services');
-                if (settings) settings.hidden = !(report.can_manage === true && action === 'settings');
-                if (services) services.hidden = !(report.can_manage === true && action === 'services');
-            }
-            if (indicator) {
-                const text = age + ' · ' + (summary || server);
-                if (indicator.textContent !== text) indicator.textContent = text;
-                indicator.dataset.state = online === null ? 'checking' : online === false ? 'offline' : detail ? 'warning' : 'ok';
-                indicator.title = [age, server, detail].filter(Boolean).join(' · ');
-            }
+            const text = age + ' · ' + (summary || server);
+            if (indicator.textContent !== text) indicator.textContent = text;
+            indicator.dataset.state = online === null ? 'checking' : online === false ? 'offline' : detail ? 'warning' : 'ok';
+            indicator.title = [age, server, cameraTime(shown), detail].filter(Boolean).join(' · ');
+
+            const message = byId('sidebar-live-detail');
+            if (message.textContent !== detail) message.textContent = detail;
+            byId('live-login').hidden = !(action === 'login' || (adminAction && report.can_sign_in_to_manage === true));
+            byId('live-retry').hidden = action !== 'retry';
+            const settings = byId('live-settings'), services = byId('live-services');
+            if (settings) settings.hidden = !(report.can_manage === true && action === 'settings');
+            if (services) services.hidden = !(report.can_manage === true && action === 'services');
         }
 
         function draw() {
@@ -139,7 +123,6 @@
                 previous.replaceWith(image);
             }
             shown = entry;
-            displayTime(entry);
             transferError = null;
             render();
         }, issue => {
@@ -179,11 +162,14 @@
             render();
         });
 
-        if (view) {
+        if (indicator) {
             byId('live-retry').addEventListener('click', () => {
-                frames.stop();
+                frames?.stop();
                 poll.refresh();
             });
+            window.setInterval(render, 1000);
+        }
+        if (view) {
             view.addEventListener('click', event => {
                 if (!event.target.closest('[data-live-fullscreen], #latest-image, #canvas')) return;
                 const screen = view.querySelector('[data-live-screen]');
@@ -195,7 +181,6 @@
             });
             window.addEventListener('resize', draw);
         }
-        window.setInterval(render, 1000);
         followLivePage([poll], frames);
     }
 

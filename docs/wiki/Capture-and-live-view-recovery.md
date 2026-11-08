@@ -7,10 +7,9 @@ For a Wi-Fi-only Pi that travels between networks, see [Wi-Fi recovery](Wi-Fi-Re
 * If the companion reports a lost connection, leave the window open. It retains the last decoded frame and checks again when the connection returns or the window becomes visible. A chart failure need not interrupt the live image.
 * If the Pi responds but the image is old, compare the last stored capture with the current time. Allow for exposure, the configured capture interval and processing. A scheduled pause or disabled daytime capture is expected.
 
-The live view shows the age and camera-local time of the picture on screen. Its age keeps counting up while the next picture downloads. Once the new image is visible, the time and age refer to that frame. The short line at the bottom of the sidebar stays visible when the Status section is closed. On other pages it reports the latest available image for the selected camera.
+Open **Status** at the bottom of the sidebar to see the image age and server connection alongside the capture service status. In the live view, the age refers to the picture on screen until the next image finishes loading. On other pages it refers to the latest available image from the selected camera. Hover over the age to see the camera-local timestamp.
 
-If an update stalls, the live view shows the reason when the camera can provide one. The browser retries interrupted requests automatically. **Retry now** requests the image again. For a paused capture or a service issue, the page links to the relevant settings or service controls when you have access.
-* If a new image is being loaded, the displayed timestamp still describes the visible image. It advances when the replacement is ready to display.
+If updates stall, **Status** shows the reason when available. The browser retries interrupted requests automatically. **Retry now** checks again immediately. For a paused capture or a service issue, the same section links to the relevant settings or service controls when you have access.
 
 On a source installation, `systemctl --user status indi-allsky.service gunicorn-indi-allsky.service` separates the capture service from the web application. In the default SQLite installation you can inspect the capture supervisor's status without modifying the database:
 
