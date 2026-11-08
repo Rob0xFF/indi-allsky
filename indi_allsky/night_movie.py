@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import os
+from fractions import Fraction
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -82,11 +83,14 @@ def local_sources(entries, skip):
     return digest.hexdigest(), paths
 
 
-def movie_inputs(source_signature, config):
+def movie_inputs(source_signature, config, panorama=False):
     # A corrected codec/filter or a changed preprocessor is also a new attempt,
     # even if the source files themselves have not changed.
     options = {k: v for k, v in config.items() if k.startswith('FFMPEG_') or k in
                ('TIMELAPSE', 'TIMELAPSE_SKIP_FRAMES', 'IMAGE_FILE_TYPE')}
+    if panorama:
+        # Retry previous failures after upgrading the panorama encoder and checks.
+        options['panorama_encoder_version'] = 1
     data = json.dumps(options, sort_keys=True, separators=(',', ':')).encode()
     return hashlib.sha256(source_signature.encode('ascii') + b'\0' + data).hexdigest()
 
@@ -102,7 +106,7 @@ def readable_images(paths):
         yield path
 
 
-def playable(path, ffmpeg='ffmpeg'):
+def playable(path, ffmpeg='ffmpeg', *, seek=None):
     try:
         if not path.stat().st_size:
             return False
@@ -110,9 +114,11 @@ def playable(path, ffmpeg='ffmpeg'):
         return False
     # Some corrupt inputs return exit status zero without emitting a frame.
     # One RGB pixel in stdout proves that an actual video frame was decoded.
+    seek_options = ['-xerror', '-ss', '{:.6f}'.format(seek)] if seek is not None else []
     try:
         result = subprocess.run([
-            ffmpeg, '-nostdin', '-v', 'error', '-protocol_whitelist', 'file,pipe', '-threads', '1', '-i', str(path),
+            ffmpeg, '-nostdin', '-v', 'error', '-protocol_whitelist', 'file,pipe', '-threads', '1',
+            *seek_options, '-i', str(path),
             '-map', '0:v:0', '-frames:v', '1', '-vf', 'scale=1:1', '-pix_fmt', 'rgb24',
             '-c:v', 'rawvideo', '-threads', '1', '-f', 'rawvideo', '-',
         ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
@@ -122,15 +128,110 @@ def playable(path, ffmpeg='ffmpeg'):
     return result.returncode == 0 and len(result.stdout) == 3
 
 
+# H.264 Annex A limits, expressed in macroblocks per frame and per second.
+_H264_LEVELS = {
+    9: (99, 1485), 10: (99, 1485), 11: (396, 3000), 12: (396, 6000),
+    13: (396, 11880), 20: (396, 11880), 21: (792, 19800), 22: (1620, 20250),
+    30: (1620, 40500), 31: (3600, 108000), 32: (5120, 216000), 40: (8192, 245760),
+    41: (8192, 245760), 42: (8704, 522240), 50: (22080, 589824), 51: (36864, 983040),
+    52: (36864, 2073600), 60: (139264, 4177920), 61: (139264, 8355840), 62: (139264, 16711680),
+}
+
+
+def _panorama_stream(path, ffmpeg, *, count_frames=False, timeout=30):
+    if not path.exists():
+        return {}
+    try:
+        result = subprocess.run([
+            str(Path(ffmpeg).with_name('ffprobe')), '-v', 'error', '-protocol_whitelist', 'file,pipe',
+            '-threads', '1', '-select_streams', 'v:0', *(['-count_frames'] if count_frames else []),
+            '-show_entries', 'stream=width,height,codec_name,level,avg_frame_rate,duration,nb_frames,nb_read_frames:format=duration',
+            '-of', 'json', str(path),
+        ], capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise TimelapseException('Could not inspect panorama with ffprobe') from error
+    if result.returncode or (count_frames and result.stderr.strip()):
+        return {}
+    try:
+        probe = json.loads(result.stdout)
+        stream = probe['streams'][0]
+        if not stream.get('duration') or stream['duration'] == 'N/A':
+            stream['duration'] = probe['format']['duration']
+        return stream
+    except (KeyError, IndexError, TypeError, ValueError):
+        return {}
+
+
+def panorama_frames(path, ffmpeg='ffmpeg'):
+    """Read the original frame count, including WebM files without a stored count."""
+    stream = _panorama_stream(path, ffmpeg)
+    if not stream:
+        return None
+    try:
+        if int(stream.get('nb_frames') or 0) > 0:
+            return int(stream['nb_frames'])
+    except (TypeError, ValueError):
+        pass
+    counted = _panorama_stream(path, ffmpeg, count_frames=True, timeout=600)
+    try:
+        frames = int(counted['nb_read_frames'])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return frames if frames > 0 else None
+
+
+def panorama_playable(path, ffmpeg='ffmpeg', *, expected_frames=None):
+    """Check browser dimensions, H.264 level and the movie timeline.
+
+    A newly encoded file must decode one frame for each retained source image.
+    Existing movies use inexpensive seek checks during regular archive scans.
+    """
+    from .panorama import PANORAMA_VIDEO_MAX_WIDTH, PANORAMA_VIDEO_MAX_HEIGHT
+    if expected_frames is None:
+        stream = _panorama_stream(path, ffmpeg)
+    else:
+        # Count decoded frames, not just the MP4 index. WebM commonly omits nb_frames.
+        stream = _panorama_stream(path, ffmpeg, count_frames=True, timeout=max(120, expected_frames // 2))
+    try:
+        if expected_frames is not None and int(stream['nb_read_frames']) != expected_frames:
+            return False
+        width, height = stream['width'], stream['height']
+        if not (0 < width <= PANORAMA_VIDEO_MAX_WIDTH and 0 < height <= PANORAMA_VIDEO_MAX_HEIGHT):
+            return False
+        fps = Fraction(stream['avg_frame_rate'])
+        duration = Fraction(stream['duration'])
+        if fps <= 0 or duration <= 0:
+            return False
+        if stream['codec_name'] == 'h264' and stream.get('level') in _H264_LEVELS:
+            max_frame, max_rate = _H264_LEVELS[stream['level']]
+            mb_width, mb_height = (width + 15) // 16, (height + 15) // 16
+            macroblocks = mb_width * mb_height
+            if (max(mb_width, mb_height) ** 2 > 8 * max_frame or
+                    macroblocks > max_frame or macroblocks * fps > max_rate):
+                return False
+    except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError):
+        return False
+
+    # Seek just before the final frame. Seeking past its presentation timestamp
+    # would report no image even for a valid two-frame panorama.
+    last = max(0, duration - Fraction(3, 2) / fps)
+    for offset in sorted({0, min(duration / 2, last), last}):
+        if not playable(path, ffmpeg, seek=float(offset)):
+            return False
+    return True
+
+
 @contextmanager
-def staged_movie(destination, ffmpeg='ffmpeg'):
+def staged_movie(destination, ffmpeg='ffmpeg', *, panorama_frames=None):
     with tempfile.NamedTemporaryFile(prefix='.encode-', suffix=destination.suffix,
                                      dir=destination.parent, delete=False) as stream:
         temporary = Path(stream.name)
     try:
         yield temporary
-        if not playable(temporary, ffmpeg):
-            raise TimelapseException('Encoded timelapse contains no decodable video frame')
+        verified = (playable(temporary, ffmpeg) if panorama_frames is None else
+                    panorama_playable(temporary, ffmpeg, expected_frames=panorama_frames))
+        if not verified:
+            raise TimelapseException('Encoded timelapse failed video validation')
         # The next database commit publishes this unique filename. Readers of
         # the old row keep their old movie until the replacement is complete.
         os.replace(temporary, destination)
@@ -151,7 +252,7 @@ def _repair_movie(worker, camera, date, night, panorama, frame_model, movie_mode
         return False
     if movies:
         path = Path(movies[0].getFilesystemPath())
-        if verified_media(path, playable):
+        if verified_media(path, panorama_playable if panorama else playable):
             if not movies[0].success:
                 movies[0].success = True
                 movies[0].fileSize = path.stat().st_size
@@ -168,7 +269,7 @@ def _repair_movie(worker, camera, date, night, panorama, frame_model, movie_mode
     entries = frame_model.query.filter_by(camera_id=camera.id, dayDate=date, night=night, exclude=False)
     skip = worker.config.get('TIMELAPSE_SKIP_FRAMES', 4)
     signature, sources = local_sources(entries.order_by(frame_model.id), skip)
-    signature = movie_inputs(signature, worker.config)
+    signature = movie_inputs(signature, worker.config, panorama=panorama)
     if not movies and not sources and not entries.first():
         return False  # there is no evidence this camera recorded this product
     failures = 0

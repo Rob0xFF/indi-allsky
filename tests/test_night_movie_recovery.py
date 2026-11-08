@@ -1,7 +1,9 @@
 """Exercise the real task/asset database. The Flask instance is local to each test."""
 from datetime import date, datetime, timedelta
+import os
 from pathlib import Path
 import shutil
+import subprocess
 from unittest.mock import Mock
 
 from flask import Flask
@@ -164,9 +166,16 @@ def test_panorama_day_night_are_distinct_and_existing_failed_id_has_priority(sta
     watch_id = missing.id
     for night in (False, True):
         pano_frames(worker, camera, date, night, 6, str(night))
+    # Files restored from backup may have mtimes opposite to capture order.
+    for index in range(6):
+        stamp = 100 - index
+        os.utime(worker.image_dir / f'True-{index}.jpg', (stamp, stamp))
     assert night_movie.reconcile(worker)
     fixed = db.session.get(PanoMovie, watch_id)
     assert fixed.success and fixed.frames == 2 and night_movie.playable(Path(fixed.getFilesystemPath()))
+    pixels = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(fixed.getFilesystemPath()),
+        '-vf', 'scale=1:1', '-pix_fmt', 'rgb24', '-f', 'rawvideo', '-'])
+    assert len(pixels) == 6 and 65 < pixels[0] < pixels[3]
     assert not PanoMovie.query.filter_by(night=False).first()
     assert night_movie.reconcile(worker)
     daytime = PanoMovie.query.filter_by(night=False).one()
@@ -184,8 +193,8 @@ def test_explicit_panorama_delete_during_repair_keeps_day_and_night_separate(sta
     worker.config.update(FISH2PANO={'ENABLE': True})
     pano_frames(worker, camera, day, False, 2)
     original = TimelapseGenerator.generate
-    def cancel(self, path, frames):
-        original(self, path, frames)
+    def cancel(self, path, frames, preserve_order=False):
+        original(self, path, frames, preserve_order=preserve_order)
         night_movie.suppress_repair(camera.id, day, False, panorama=True)
     monkeypatch.setattr(TimelapseGenerator, 'generate', cancel)
     night_movie.reconcile(worker)
@@ -258,3 +267,63 @@ def test_interrupted_encode_retries_once_after_cooldown(station, monkeypatch):
     assert Task.query.count() == 2 and Movie.query.count() == 0
     record = db.session.get(State, night_movie.attempt_key(camera.id, day))
     assert json.loads(record.value)['attempt'] == 2
+
+
+@pytest.mark.skipif(not shutil.which('ffmpeg') or not shutil.which('ffprobe'), reason='ffmpeg and ffprobe required')
+@pytest.mark.parametrize('corrupt_header', [False, True])
+def test_incompatible_or_corrupt_panorama_is_repaired_once(station, corrupt_header):
+    import subprocess
+    from indi_allsky.flask.models import IndiAllSkyDbPanoramaVideoTable as PanoMovie
+    worker, camera, today, _ = station
+    worker.config.update(FISH2PANO={'ENABLE': True})
+    day = today - timedelta(days=1)
+    legacy = worker.image_dir / 'legacy-panorama.mp4'
+    if corrupt_header:
+        legacy.write_bytes(b'broken MP4')
+    else:
+        subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=s=2048x96:r=5',
+                    '-frames:v', '4', '-c:v', 'libx264', '-threads', '1', str(legacy)], check=True)
+    assert night_movie.playable(legacy) == (not corrupt_header)
+    existing = PanoMovie(camera_id=camera.id, dayDate=day, night=True, filename=legacy.name,
+                         frames=8 if corrupt_header else 4, success=True)
+    db.session.add(existing)
+    db.session.commit()
+    watch_id = existing.id
+    pano_frames(worker, camera, day, True, 4)
+    assert night_movie.reconcile(worker)
+    published = PanoMovie.query.one()
+    assert published.id == watch_id and published.success and published.frames == 4
+    assert night_movie.panorama_playable(Path(published.getFilesystemPath()))
+    assert not legacy.exists()
+    assert not night_movie.reconcile(worker)
+    assert Task.query.count() == 1
+
+
+@pytest.mark.skipif(not shutil.which('ffmpeg') or not shutil.which('ffprobe'), reason='ffmpeg and ffprobe required')
+def test_partial_source_archive_preserves_the_longer_existing_panorama(station):
+    import subprocess
+    from indi_allsky.flask.models import IndiAllSkyDbPanoramaVideoTable as PanoMovie
+    worker, camera, today, _ = station
+    worker.config.update(FISH2PANO={'ENABLE': True}, TIMELAPSE_SKIP_FRAMES=1)
+    day = today - timedelta(days=1)
+    legacy = worker.image_dir / 'original.mp4'
+    subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=s=2048x96:r=5',
+                    '-frames:v', '4', '-c:v', 'libx264', '-threads', '1', str(legacy)], check=True)
+    original = legacy.read_bytes()
+    # Some older rows have a negative frame count; the file itself records four.
+    existing = PanoMovie(camera_id=camera.id, dayDate=day, night=True, filename=legacy.name, frames=-4, success=True)
+    db.session.add(existing)
+    db.session.commit()
+    watch_id = existing.id
+    pano_frames(worker, camera, day, True, 4)
+    assert night_movie.reconcile(worker)
+    assert Task.query.one().state == TaskQueueState.FAILED
+    assert 'Existing panorama retained' in Task.query.one().result
+    assert PanoMovie.query.one().id == watch_id and PanoMovie.query.one().filename == legacy.name
+    assert legacy.read_bytes() == original
+    assert not night_movie.reconcile(worker)
+    pano_frames(worker, camera, day, True, 1, 'restored')
+    assert night_movie.reconcile(worker)
+    assert PanoMovie.query.one().id == watch_id and PanoMovie.query.one().frames == 4
+    assert night_movie.panorama_playable(Path(PanoMovie.query.one().getFilesystemPath()), expected_frames=4)
+    assert not legacy.exists()

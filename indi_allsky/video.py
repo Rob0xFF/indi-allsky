@@ -1250,6 +1250,7 @@ class VideoWorker(Process):
             mini_tg = TimelapseGenerator(
                 self.config,
                 skip_frames=0,
+                panorama=panorama,
             )
 
             mini_tg.codec = codec
@@ -1379,7 +1380,7 @@ class VideoWorker(Process):
         repair = kwargs.get('repair', False)
         if previous:
             if repair:
-                if previous.remote_url or previous.s3_key or night_movie.playable(Path(previous.getFilesystemPath())):
+                if previous.remote_url or previous.s3_key or night_movie.panorama_playable(Path(previous.getFilesystemPath())):
                     task.setSuccess('Existing panorama timelapse preserved')
                     return
             elif not self.config.get('TIMELAPSE_OVERWRITE'):
@@ -1395,7 +1396,7 @@ class VideoWorker(Process):
             .filter(IndiAllSkyDbPanoramaImageTable.dayDate == d_dayDate)\
             .filter(IndiAllSkyDbPanoramaImageTable.night == night)\
             .filter(IndiAllSkyDbPanoramaImageTable.exclude == sa_false())\
-            .order_by(IndiAllSkyDbPanoramaImageTable.createDate.asc())
+            .order_by(IndiAllSkyDbPanoramaImageTable.createDate.asc(), IndiAllSkyDbPanoramaImageTable.id.asc())
 
 
         timelapse_files_entries_count = timelapse_files_entries.count()
@@ -1470,6 +1471,18 @@ class VideoWorker(Process):
                 timeofday, timespec, len(timelapse_files), timelapse_skip_frames))
             return
 
+        expected_frames = len(timelapse_files) - timelapse_skip_frames
+        if repair and previous:
+            old_path = Path(previous.getFilesystemPath())
+            if night_movie.playable(old_path):
+                old_frames = night_movie.panorama_frames(old_path)
+                if old_frames is None and previous.frames and previous.frames > 0:
+                    old_frames = previous.frames
+                if not old_frames or expected_frames < old_frames:
+                    task.setFailed('Existing panorama retained: {} source frames available after skipping; '
+                                   'previous movie contains {} frames.'.format(expected_frames, old_frames or 'unknown'))
+                    return
+
         video_metadata = {
             'type'          : constants.PANORAMA_VIDEO,
             'createDate'    : int(now.timestamp()),
@@ -1477,7 +1490,7 @@ class VideoWorker(Process):
             'dayDate'       : d_dayDate.strftime('%Y%m%d'),
             'night'         : night,
             'framerate'     : self.config['FFMPEG_FRAMERATE'],
-            'frames'        : len(timelapse_files) - timelapse_skip_frames,
+            'frames'        : expected_frames,
             'camera_uuid'   : camera.uuid,
         }
 
@@ -1511,16 +1524,16 @@ class VideoWorker(Process):
             panorama_tg = TimelapseGenerator(
                 self.config,
                 skip_frames=timelapse_skip_frames,
+                panorama=True,
             )
 
             panorama_tg.codec = codec
             panorama_tg.framerate = framerate
             panorama_tg.bitrate = bitrate
-            #panorama_tg.vf_scale = vf_scale  # no vfscale for panorama timelapse
             panorama_tg.ffmpeg_extra_options = ffmpeg_extra_options
 
-            with night_movie.staged_movie(video_file, panorama_tg.ffmpeg_bin) as stage:
-                panorama_tg.generate(stage, timelapse_files)
+            with night_movie.staged_movie(video_file, panorama_tg.ffmpeg_bin, panorama_frames=expected_frames) as stage:
+                panorama_tg.generate(stage, timelapse_files, preserve_order=True)
             if repair and not night_movie.lock_repair(camera.id, d_dayDate, kwargs.get('repair_token'), night, True):
                 db.session.rollback()
                 video_file.unlink(missing_ok=True)
