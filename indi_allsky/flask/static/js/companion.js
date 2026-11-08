@@ -8,8 +8,9 @@
     const storageKey = 'allsky-companion-charts-' + page.dataset.cameraId;
     const interval = Math.max(5000, Number(page.dataset.refreshMs) || 15000);
     const eventNames = ['evening_start', 'evening_end', 'morning_start', 'morning_end', 'moon_rise', 'moon_set'];
-    const number = new Intl.NumberFormat('de-DE', { maximumFractionDigits: 2 });
-    const lowNumber = new Intl.NumberFormat('de-DE', { maximumSignificantDigits: 3 });
+    const eventDate = new Intl.DateTimeFormat('en', {month: 'short', day: 'numeric', timeZone: 'UTC'});
+    const number = new Intl.NumberFormat('en', { maximumFractionDigits: 2 });
+    const lowNumber = new Intl.NumberFormat('en', { maximumSignificantDigits: 3 });
     const formatReading = value => value !== 0 && Math.abs(value) < .1 ? lowNumber.format(value) : number.format(value);
     let choices = null;
     let clock = null;
@@ -21,11 +22,11 @@
     let capturePaused = false;
     let archiveIssue = '';
     const archiveMessages = {
-        mount: 'Archiv nicht eingehängt', missing: 'Archivordner fehlt',
-        reserve: 'Archiv fast voll · Zeitraffer und Exporte warten',
-        full: 'Archiv voll · Aufnahme pausiert', readonly: 'Archiv schreibgeschützt · Aufnahme pausiert',
-        write: 'Archiv nicht beschreibbar', timeout: 'Archiv antwortet nicht', checking: 'Archiv wird geprüft',
-        unknown: 'Archivstatus nicht lesbar',
+        mount: 'Archive is not mounted', missing: 'Archive folder is missing',
+        reserve: 'Archive nearly full · timelapses and exports are on hold',
+        full: 'Archive full · capture paused', readonly: 'Archive is read-only · capture paused',
+        write: 'Cannot write to the archive', timeout: 'Archive is not responding', checking: 'Checking archive',
+        unknown: 'Cannot read archive status',
     };
     let upsUnreadable = false;
     let lastPayload;
@@ -49,11 +50,11 @@
 
     function clockFormats(zone) {
         const make = timeZone => {
-            const options = {timeZone, hour: '2-digit', minute: '2-digit'};
+            const options = {timeZone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23'};
             return {
                 zone, useOffset: !zone || zone !== timeZone,
-                minutes: new Intl.DateTimeFormat('de-DE', options),
-                seconds: new Intl.DateTimeFormat('de-DE', {...options, second: '2-digit'}),
+                minutes: new Intl.DateTimeFormat('en', options),
+                seconds: new Intl.DateTimeFormat('en', {...options, second: '2-digit'}),
             };
         };
         // Some browsers have an older timezone database than the camera.
@@ -64,7 +65,7 @@
     function dateAndTime(iso) {
         const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/.exec(iso || '');
         if (!match) return null;
-        return { date: match[3] + '.' + match[2] + '.' + match[1], time: match[4] + ':' + match[5],
+        return { date: match[1] + '-' + match[2] + '-' + match[3], time: match[4] + ':' + match[5],
             seconds: match[6] || '00' };
     }
 
@@ -73,7 +74,7 @@
         const formatted = dateAndTime(iso);
         if (!formatted) {
             cell.textContent = '–';
-            cell.title = 'Kein Ereignis im berechneten Zeitraum';
+            cell.title = 'No event in this period';
             return;
         }
         cell.removeAttribute('title');
@@ -83,7 +84,7 @@
         time.title = formatted.date + ' · ' + formatted.time;
         const date = document.createElement('span');
         date.className = 'event-date';
-        date.textContent = formatted.date.slice(0, 6); // Day and month; the full date is in the tooltip.
+        date.textContent = eventDate.format(Date.parse(formatted.date)); // The ISO date is already in camera local time.
         const hour = document.createElement('strong');
         hour.textContent = formatted.time;
         time.append(hour, date);
@@ -98,12 +99,12 @@
         const lines = [];
         if (imageServiceMessage) lines.push(imageServiceMessage);
         else if (frames.active && performance.now() - frames.active.startedAt > 800) {
-            lines.push('Neue Aufnahme vorhanden · Bild lädt');
+            lines.push('New capture available · loading image');
         } else if (imageMessage) lines.push(imageMessage);
-        else if (capturePaused) lines.push('Pi erreichbar · Aufnahme pausiert');
-        else if (imageIsLate()) lines.push('Pi erreichbar · keine neue Aufnahme');
+        else if (capturePaused) lines.push('Pi online · capture paused');
+        else if (imageIsLate()) lines.push('Pi online · no new image');
         if (archiveIssue) lines.push(archiveIssue);
-        if (upsUnreadable) lines.push('USV nicht auslesbar');
+        if (upsUnreadable) lines.push('Cannot read UPS status');
         if (detailMessage && !lines.includes(detailMessage)) lines.push(detailMessage);
         const message = byId('connection-message');
         const text = lines.join(' ');
@@ -118,12 +119,13 @@
         byId('clock').dateTime = new Date(now).toISOString();
         if (displayed) {
             const seconds = Math.floor(Math.max(0, now - displayed.timestamp) / 1000);
+            const days = Math.floor(seconds / 86400);
             const age = seconds < 60 ? seconds + ' s' : seconds < 3600 ? Math.floor(seconds / 60) + ' min'
-                : seconds < 86400 ? Math.floor(seconds / 3600) + ' Std.' : Math.floor(seconds / 86400) + ' Tagen';
+                : seconds < 86400 ? Math.floor(seconds / 3600) + ' h' : days + (days === 1 ? ' day' : ' days');
             const badge = byId('image-age');
-            badge.textContent = 'vor ' + age.replace(/^1 Tagen$/, '1 Tag');
+            badge.textContent = age + ' ago';
             badge.classList.toggle('new-frame', performance.now() < displayed.highlightUntil);
-            badge.title = imageIsLate() ? 'Zeit seit der letzten bekannten Aufnahme' : 'Aktuelle Aufnahme';
+            badge.title = imageIsLate() ? 'Time since the last known capture' : 'Latest capture';
         }
         updateStatus();
     }
@@ -131,7 +133,7 @@
     const frames = new LiveFrameLoader((image, entry) => {
         imageMessage = '';
         image.id = 'capture-image';
-        image.alt = 'Letzte Aufnahme der Allsky-Kamera';
+        image.alt = 'Latest all-sky image';
         byId('capture-image').replaceWith(image);
         page.style.setProperty('--capture-aspect', image.naturalWidth / image.naturalHeight);
         byId('empty-image').hidden = true;
@@ -146,19 +148,19 @@
         hour.textContent = formatted.time + ':' + formatted.seconds;
         time.replaceChildren(hour, date);
         time.dateTime = entry.captured_at;
-        document.querySelector('.caption-label').textContent = entry.time_source === 'file' ? 'Dateizeit' : 'Aufnahme';
+        document.querySelector('.caption-label').textContent = entry.time_source === 'file' ? 'File time' : 'Captured';
         tick();
     }, issue => {
-        imageMessage = issue === 'timeout' ? 'Bildabruf dauert zu lange · neuer Versuch folgt' : 'Bild konnte nicht geladen werden · neuer Versuch folgt';
-        if (!displayed) byId('empty-image').textContent = 'Bild nicht verfügbar';
+        imageMessage = issue === 'timeout' ? 'Image request timed out · retrying' : 'Could not load image · retrying';
+        if (!displayed) byId('empty-image').textContent = 'Image unavailable';
         updateStatus();
     });
 
     function updateImage(entry) {
         if (entry === null) {
             frames.stop();
-            imageMessage = capturePaused ? 'Pi erreichbar · Aufnahme pausiert' : 'Pi erreichbar · keine neue Aufnahme';
-            if (!displayed) byId('empty-image').textContent = 'Keine Aufnahme verfügbar';
+            imageMessage = capturePaused ? 'Pi online · capture paused' : 'Pi online · no new image';
+            if (!displayed) byId('empty-image').textContent = 'No image available';
             return;
         }
         if (!entry || typeof entry.url !== 'string' || !entry.url || !dateAndTime(entry.captured_at)
@@ -173,7 +175,7 @@
         const active = choices || defaults;
         selects.forEach((select, slot) => {
             const previous = Array.from(select.options).map(option => [option.value, option.label]);
-            const options = [['', 'Aus'], ...metrics.map(metric => [metric.id, metric.label])];
+            const options = [['', 'Off'], ...metrics.map(metric => [metric.id, metric.label])];
             if (JSON.stringify(previous) !== JSON.stringify(options)) {
                 select.replaceChildren(...options.map(([value, label]) => new Option(label, value)));
             }
@@ -204,7 +206,7 @@
             const offset = point.capturedAt.match(/[+-]\d{2}:\d{2}$/);
             return time.time + ' UTC' + (offset ? offset[0] : '');
         };
-        reading.title = last ? (last.y === null ? 'Keine gültige Messung um ' : 'Letzter Messwert um ') + sampleTime(last) : '';
+        reading.title = last ? (last.y === null ? 'No valid reading at ' : 'Last reading at ') + sampleTime(last) : '';
         const visible = values.length > 0 && typeof Chart === 'function';
         plot.hidden = !visible;
         empty.hidden = !selects[slot].value || visible;
@@ -263,13 +265,13 @@
     }
 
     function serviceError(issue, code, details) {
-        if (issue === 'login') return 'Anmeldung erforderlich · bitte erneut anmelden';
-        if (issue === 'forbidden') return 'Zugriff auf die Kameradaten verweigert';
-        if (details) return 'Dämmerung, Mond und Verlauf konnten nicht aktualisiert werden.';
-        if (issue === 'network') return 'Verbindung zum Pi unterbrochen';
-        if (issue === 'timeout') return 'Der Pi antwortet zu langsam · neuer Versuch folgt';
-        if (issue === 'server') return 'Pi erreichbar · Bilddienst meldet HTTP ' + code;
-        return 'Pi erreichbar · unerwartete Antwort des Bilddienstes';
+        if (issue === 'login') return 'Sign in again to view camera data';
+        if (issue === 'forbidden') return 'Access to camera data denied';
+        if (details) return 'Could not update twilight, moon or history data.';
+        if (issue === 'network') return 'Lost connection to the Pi';
+        if (issue === 'timeout') return 'Pi response timed out · retrying';
+        if (issue === 'server') return 'Pi online · image service returned HTTP ' + code;
+        return 'Pi online · unexpected response from the image service';
     }
 
     const imagePoll = new LiveJsonPoll(() => {
@@ -286,7 +288,7 @@
         tick();
     }, (issue, code) => {
         imageServiceMessage = serviceError(issue, code, false);
-        if (!displayed) byId('empty-image').textContent = 'Bild nicht verfügbar';
+        if (!displayed) byId('empty-image').textContent = 'Image unavailable';
         updateStatus();
     });
 
@@ -304,7 +306,7 @@
         const astronomy = payload.astronomy;
         for (const id of eventNames) showEvent(id, astronomy[id]);
         const phase = [astronomy.moon_phase];
-        if (Number.isFinite(astronomy.moon_illumination)) phase.push(number.format(astronomy.moon_illumination) + ' %');
+        if (Number.isFinite(astronomy.moon_illumination)) phase.push(number.format(astronomy.moon_illumination) + '%');
         byId('moon-phase').textContent = phase.filter(Boolean).join(' · ') || '–';
         showHistory(payload);
         lastPayload = payload;
