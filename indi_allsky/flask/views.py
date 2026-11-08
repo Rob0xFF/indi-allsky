@@ -25,6 +25,9 @@ from passlib.hash import argon2
 
 from ..version import __version__
 from .. import constants
+from ..archive_health import archive_state, BLOCKED
+from ..companion_astronomy import camera_timezone
+from ..live_status import capture_time, health_reason, latest_live_row
 from ..sensor_health import custom_chart_values
 from ..night_movie import attempt_key, prior_attempt, suppress_repair
 from .. import asi676mc
@@ -54,7 +57,7 @@ from flask import current_app as app
 from flask_login import login_required
 from flask_login import current_user
 
-from .misc import login_optional_media
+from .misc import login_optional_media, media_access_allowed
 
 from . import db
 
@@ -327,6 +330,13 @@ class JsonLatestImageView(JsonView):
         night = self.camera_is_night if requested_night == 'auto' else bool(int(requested_night))
 
 
+        live = request.args.get('live_status') == '1'
+        history_allowed = live and media_access_allowed()
+        now = None
+        if live:
+            zone = camera_timezone(self.camera) if self.camera.id > 0 else timezone.utc
+            now = datetime.now(timezone.utc).astimezone(zone)
+
         no_image_message = 'No Image for 15 minutes'
 
 
@@ -344,55 +354,133 @@ class JsonLatestImageView(JsonView):
         }
 
 
-        if self.indi_allsky_config.get('FOCUS_MODE', False) and self.local_indi_allsky:
-            if self.live_file_allowed:
-                self.setLiveFile(data['latest_image'], history_seconds)
+        entry = data['latest_image']
+        if live:
+            entry.update(captured_at=None, time_source=None, frame_key=None)
+
+        def respond(reason=None):
+            if live:
+                if history_allowed and reason in ('paused', 'daytime_disabled', 'daytime_unsaved_remote', 'local_file_restricted'):
+                    self.set_last_permitted_image(entry, now, history_seconds)
+                data['live_status'] = self.get_live_status(entry, now, night, reason)
             return data
 
+        if live and self.camera.id < 1:
+            return respond('no_camera')
+
+        if self.indi_allsky_config.get('FOCUS_MODE', False) and self.local_indi_allsky:
+            if not self.live_file_allowed:
+                return respond('local_file_restricted')
+            self.setLiveFile(entry, history_seconds, allow_stale=history_allowed, now=now)
+            if live and not entry['url'] and self.live_archive_state.get('level') != BLOCKED:
+                return respond('focus_waiting')
+            return respond()
 
         if self.capture_pause:
-            data['latest_image']['message'] = 'Capture paused'
-            return data
-
+            entry['message'] = 'Capture paused'
+            return respond('paused')
 
         if not night:
-            ### day
-            if not self.local_indi_allsky and self.daytime_capture and not self.daytime_capture_save:
-                # remote cameras will not receive daytime images when save is disabled
+            remote_unsaved = not self.local_indi_allsky and self.daytime_capture and not self.daytime_capture_save
+            if not self.daytime_capture or remote_unsaved:
                 if self.sun_set_date:
                     utcnow = datetime.now(tz=timezone.utc)
                     delta_sun_set = self.sun_set_date - utcnow.replace(tzinfo=None)
-                    data['latest_image']['message'] = 'Daytime capture disabled.<br><div class="tw:text-warning">Night starts in {0:0.1f} hours.</div>'.format(delta_sun_set.total_seconds() / 3600)
+                    entry['message'] = 'Daytime capture disabled.<br><div class="tw:text-warning">Night starts in {0:0.1f} hours.</div>'.format(delta_sun_set.total_seconds() / 3600)
                 else:
-                    data['latest_image']['message'] = 'Daytime capture disabled.<br><div class="tw:text-warning">Sun never sets.</div>'
+                    entry['message'] = 'Daytime capture disabled.<br><div class="tw:text-warning">Sun never sets.</div>'
+                return respond('daytime_unsaved_remote' if remote_unsaved else 'daytime_disabled')
 
-                return data
-            elif not self.daytime_capture:
-                if self.sun_set_date:
-                    utcnow = datetime.now(tz=timezone.utc)
-                    delta_sun_set = self.sun_set_date - utcnow.replace(tzinfo=None)
-                    data['latest_image']['message'] = 'Daytime capture disabled.<br><div class="tw:text-warning">Night starts in {0:0.1f} hours.</div>'.format(delta_sun_set.total_seconds() / 3600)
-                else:
-                    data['latest_image']['message'] = 'Daytime capture disabled.<br><div class="tw:text-warning">Sun never sets.</div>'
-                return data
+            if not self.daytime_capture_save:
+                if not self.live_file_allowed:
+                    return respond('local_file_restricted')
+                self.setLiveFile(entry, history_seconds, allow_stale=True, now=now)
+                return respond()
 
-            elif self.daytime_capture and not self.daytime_capture_save:
-                if self.live_file_allowed:
-                    self.setLiveFile(data['latest_image'], history_seconds, allow_stale=True)
-                return data
-
-
-        # use database
-        latest_image_data = self.getLatestImage(camera_id, history_seconds, not_after=self.camera_now)
-        if latest_image_data.get('url'):
-            data['latest_image']['url'] = latest_image_data['url']
-            data['latest_image']['width'] = latest_image_data['width']
-            data['latest_image']['height'] = latest_image_data['height']
-            data['latest_image']['message'] = ''
+        if live:
+            limit = None if history_allowed else min(history_seconds, self.history_seconds)
+            self.set_archive_frame(entry, now, limit)
+        else:
+            latest = self.getLatestImage(camera_id, history_seconds, not_after=self.camera_now)
+            if latest.get('url'):
+                entry.update(url=latest['url'], width=latest['width'], height=latest['height'], message='')
+        return respond()
 
 
-        return data
+    def set_archive_frame(self, entry, now, limit=None):
+        latest = self.getLatestImage(self.camera.id, None, live_now=now)
+        if not latest.get('url'):
+            return
+        captured = capture_time(latest['create_date'], latest['utc_offset'], now)
+        if limit is not None and (captured is None or now.timestamp() - captured.timestamp() >= limit):
+            return  # A public live page must not disclose a media-protected older URL.
+        entry.update(url=latest['url'], width=latest['width'], height=latest['height'], message='',
+                     captured_at=captured.isoformat() if captured is not None else None,
+                     time_source='capture', frame_key='{}:{}'.format(self.camera.id, latest['id']))
 
+
+    def set_last_permitted_image(self, entry, now, history_seconds):
+        # Show the previous frame when opening a paused station in a new tab.
+        message = entry['message']
+        self.set_archive_frame(entry, now)
+        uses_file = self.indi_allsky_config.get('FOCUS_MODE') or not self.daytime_capture_save
+        if uses_file and self.live_file_allowed:
+            file = {}
+            self.setLiveFile(file, history_seconds, allow_stale=True, now=now)
+            if file.get('url'):
+                archive_time = entry.get('captured_at')
+                if not archive_time or datetime.fromisoformat(file['captured_at']) > datetime.fromisoformat(archive_time):
+                    entry.update(file)
+        entry['message'] = message
+
+
+    def get_live_status(self, entry, now, night, reason):
+        config = self.indi_allsky_config
+        if self.local_indi_allsky:
+            cadence = max(float(config.get('CCD_EXPOSURE_MAX') or 15),
+                          float(config.get('EXPOSURE_PERIOD' if night else 'EXPOSURE_PERIOD_DAY') or 0))
+            stale_after = max(90, int(2 * cadence + 15))
+        else:
+            # A synchronized camera does not publish its capture interval.
+            stale_after = self.history_seconds
+
+        status = {'now': now.isoformat(), 'stale_after_s': stale_after, 'reason': reason,
+                  'can_manage': False, 'can_sign_in_to_manage': False}
+        captured = entry.get('captured_at')
+        delayed = not captured or now.timestamp() - datetime.fromisoformat(captured).timestamp() > stale_after
+        if entry.get('url') and not captured and not reason:
+            status['reason'] = 'capture_time_unknown'
+            delayed = False
+        elif delayed and not reason:
+            status['reason'] = 'no_recent_image'
+        if not self.local_indi_allsky or self.camera.id < 1:
+            return status
+        admin = current_user.is_authenticated and current_user.is_admin
+        trusted = not admin and self.verify_admin_network()
+        if not admin and not (trusted and (not self.web_nonlocal_images or self.web_local_images_admin)):
+            return status
+        active = self.live_states.get('DB_CAMERA_ID')
+        if active is None or active.value != str(self.camera.id):
+            return status  # Supervisor state belongs to the active local camera only.
+        status['can_manage'] = bool(admin or (self.login_disabled and trusted))
+        status['can_sign_in_to_manage'] = bool(trusted and not self.login_disabled and not current_user.is_authenticated)
+        if delayed and not reason:
+            health = self.live_states.get('CAPTURE_HEALTH')
+            if health is not None and health.createDate < active.createDate:
+                health = None  # A newly connected camera has not reported yet.
+            issue = health_reason(health, self.live_archive_state, now)
+            status['reason'] = issue or status['reason']
+        return status
+
+
+    @cached_property
+    def live_states(self):
+        return {row.key: row for row in IndiAllSkyDbStateTable.query.filter(
+            IndiAllSkyDbStateTable.key.in_(('DB_CAMERA_ID', 'CAPTURE_HEALTH')))}
+
+    @cached_property
+    def live_archive_state(self):
+        return archive_state(self.indi_allsky_config)
 
     @cached_property
     def local_images_allowed(self):
@@ -409,20 +497,29 @@ class JsonLatestImageView(JsonView):
         ).first()
         return active is not None and active.id == self.camera.id
 
-    def setLiveFile(self, entry, history_seconds, allow_stale=False):
+    def setLiveFile(self, entry, history_seconds, allow_stale=False, now=None):
+        if now is not None:
+            active = self.live_states.get('DB_CAMERA_ID')
+            if (active is None or active.value != str(self.camera.id)
+                    or self.live_archive_state.get('level') == BLOCKED):
+                return
         uri = Path(self.latest_image_t.format(self.indi_allsky_config.get('IMAGE_FILE_TYPE', 'jpg')))
         try:
             stamp = (Path(self.indi_allsky_config['IMAGE_FOLDER']) / uri.name).stat()
         except OSError:
             return
-        stale = stamp.st_mtime <= (self.camera_now - timedelta(seconds=history_seconds)).timestamp()
-        if stamp.st_mtime > self.camera_now.timestamp() or (stale and not allow_stale):
+        now_s = now.timestamp() if now is not None else self.camera_now.timestamp()
+        stale = stamp.st_mtime <= now_s - history_seconds
+        if stamp.st_mtime > now_s or (stale and not allow_stale) or not stamp.st_size:
             return
         entry['url'] = '{0}?v={1}'.format(uri, stamp.st_mtime_ns)
         entry['message'] = 'Image is out of date' if stale else ''
+        if now is not None:
+            entry.update(captured_at=datetime.fromtimestamp(stamp.st_mtime, now.tzinfo).isoformat(),
+                         time_source='file', frame_key='file:{}'.format(stamp.st_mtime_ns))
 
 
-    def getLatestImage(self, camera_id, history_seconds, not_after=None):
+    def getLatestImage(self, camera_id, history_seconds, not_after=None, *, live_now=None):
         latest_image_q = self.model.query\
             .join(self.model.camera)\
             .filter(IndiAllSkyDbCameraTable.id == camera_id)
@@ -439,9 +536,10 @@ class JsonLatestImageView(JsonView):
             ))
 
 
-        latest_image = latest_image_q\
-            .order_by(self.model.createDate.desc(), self.model.id.desc())\
-            .first()
+        if live_now is not None:
+            latest_image = latest_live_row(latest_image_q, self.model, live_now)
+        else:
+            latest_image = latest_image_q.order_by(self.model.createDate.desc(), self.model.id.desc()).first()
 
 
         if not latest_image:
@@ -450,6 +548,8 @@ class JsonLatestImageView(JsonView):
 
         try:
             url = latest_image.getUrl(s3_prefix=self.s3_prefix, local=self.local_images_allowed)
+            if live_now is not None and isinstance(url, Path) and url.is_absolute():
+                return {'url': None}  # The browser cannot serve a path outside the archive.
         except ValueError as e:
             app.logger.error('Error determining relative file name: %s', str(e))
             return {'url': None}
@@ -461,7 +561,9 @@ class JsonLatestImageView(JsonView):
             'height' : latest_image.height,
         }
 
-        if not_after is not None:
+        if live_now is not None:
+            image_data['id'] = latest_image.id
+        if not_after is not None or live_now is not None:
             image_data['create_date'] = latest_image.createDate
             image_data['utc_offset'] = latest_image.data.get('utc_offset') if isinstance(latest_image.data, dict) else None
         return image_data

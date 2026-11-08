@@ -112,7 +112,7 @@ class LiveFrameLoader {
 function followLivePage(polls, frames) {
     const pause = () => {
         for (const poll of polls) poll.stop();
-        frames.stop();
+        frames?.stop();
     };
     const resume = () => {
         pause();

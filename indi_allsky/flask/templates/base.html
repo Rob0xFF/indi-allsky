@@ -61,6 +61,10 @@
 
     <link href="{{ url_for('indi_allsky.static', filename='css/dist.css') }}?v={{ release if release else 'v2026.11.01' }}" rel="stylesheet">
     <script src="{{ url_for('indi_allsky.static', filename='js/jquery-3.7.1.min.js') }}"></script>
+    {% if (camera_id|default(0, true)|int) > 0 or latest_image_view is defined %}
+    <script defer src="{{ url_for('indi_allsky.static', filename='js/live_frames.js') }}?v=2"></script>
+    <script defer src="{{ url_for('indi_allsky.static', filename='js/latest_view.js') }}?v=2"></script>
+    {% endif %}
 
     <style>
         #sidebar a, #sidebar a:hover, #sidebar a:focus {
@@ -72,6 +76,27 @@
             padding-left: 0;
             margin-bottom: 0;
         }
+
+        #sidebar-live-status {
+            display: block;
+            margin: 0 .25rem .625rem;
+            font-size: .75rem;
+            line-height: 1.3;
+        }
+
+        #sidebar-live-status[href]:hover { text-decoration: underline; }
+        #sidebar-live-status::before {
+            content: '';
+            display: inline-block;
+            width: .5em;
+            height: .5em;
+            margin-right: .4em;
+            border-radius: 50%;
+            background: currentColor;
+        }
+        #sidebar-live-status[data-state="ok"]::before { background: var(--color-success); }
+        #sidebar-live-status[data-state="warning"]::before { background: var(--color-warning); }
+        #sidebar-live-status[data-state="offline"]::before { background: var(--color-error); }
 
         #sidebar {
             transition: width 0.25s ease, opacity 0.25s ease, transform 0.25s ease;
@@ -296,6 +321,12 @@
                     {{ status_text|safe }}
                 </div>
             </details>
+            {% if (camera_id|default(0, true)|int) > 0 %}
+            <a id="sidebar-live-status" href="{{ url_for('indi_allsky.index_view') }}"
+               title="Open the live view" data-endpoint="{{ url_for('indi_allsky.js_latest_image_view', camera_id=camera_id, limit_s=900, night='auto') }}">Checking camera…</a>
+            {% else %}
+            <span id="sidebar-live-status">No camera selected</span>
+            {% endif %}
             <div class="tw:flex tw:gap-2 tw:w-full tw:items-center">
                 <a href="{{ url_for('auth_indi_allsky.login_view') if not current_user.is_authenticated else url_for('indi_allsky.user_view') }}"
                     class="tw:btn tw:btn-sm tw:flex-1 tw:font-semibold tw:text-xs tw:border tw:border-base-content/20 tw:bg-transparent hover:tw:bg-base-content/5 tw:no-underline tw:flex tw:items-center tw:justify-center">

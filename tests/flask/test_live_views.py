@@ -8,6 +8,11 @@ from pathlib import Path
 import shutil
 import subprocess
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
+import json
+
+from indi_allsky.archive_health import BLOCKED
+from indi_allsky.live_status import capture_time, health_reason, latest_live_row
 
 from flask import Flask, request
 import ephem
@@ -28,29 +33,54 @@ def latest(tmp_path):
     path = Path(__file__).resolve().parents[2] / 'indi_allsky/flask/views.py'
     tree = ast.parse(path.read_text())
     view_class = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'JsonLatestImageView')
-    methods = [n for n in view_class.body if isinstance(n, ast.FunctionDef) and n.name in ('get_objects', 'setLiveFile')]
-    scope = {'Path': Path, 'timedelta': timedelta, 'request': request}
-    exec(compile(ast.Module(body=methods, type_ignores=[]), str(path), 'exec'), scope)
+    method_names = ('get_objects', 'setLiveFile', 'get_live_status', 'set_last_permitted_image', 'set_archive_frame')
+    methods = [n for n in view_class.body if isinstance(n, ast.FunctionDef) and n.name in method_names]
     now = datetime(2026, 11, 7, 20)
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now
+    camera_zone = now.astimezone().tzinfo
+    user = SimpleNamespace(is_authenticated=False, is_admin=False)
+    # The real archive access rule is shared with login_optional_media.
+    misc = ast.parse((path.parent/'misc.py').read_text())
+    rule = next(n for n in misc.body if isinstance(n, ast.FunctionDef) and n.name == 'media_access_allowed')
+    methods.append(rule)
+    scope = dict(Path=Path, timedelta=timedelta, request=request, datetime=Clock, timezone=timezone, BLOCKED=BLOCKED,
+                 camera_timezone=lambda camera: camera_zone, capture_time=capture_time, health_reason=health_reason, current_user=user)
+    exec(compile(ast.Module(body=methods, type_ignores=[]), str(path), 'exec'), scope)
     view = SimpleNamespace(history_seconds=900, indi_allsky_config={'IMAGE_FOLDER': str(tmp_path), 'IMAGE_FILE_TYPE': 'jpg'},
                            camera_now=now, camera_is_night=True, capture_pause=False, daytime_capture=True,
                            daytime_capture_save=False, local_indi_allsky=True, web_nonlocal_images=False,
                            live_file_allowed=True, latest_image_t='images/latest.{0}', sun_set_date=None)
     view.cameraSetup = lambda **kwargs: None
+    view.camera = SimpleNamespace(id=3, local=True)
+    view.live_archive_state = {}
+    view.login_disabled = False
+    view.web_local_images_admin = False
+    view.user = user
+    view.verify_admin_network = lambda: True
+    view.live_states = {
+        'DB_CAMERA_ID': SimpleNamespace(value='3', createDate=now-timedelta(days=1)),
+        'CAPTURE_HEALTH': SimpleNamespace(value=json.dumps({'updated':int(now.timestamp()), 'stage':'idle'}), createDate=now)
+    }
     calls = []
 
-    def get_image(camera_id, history_seconds, not_after):
+    def get_image(camera_id, history_seconds, not_after=None, live_now=None):
         calls.append((camera_id, history_seconds, not_after))
-        return {'url': 'images/archive.jpg', 'width': 640, 'height': 480}
+        return {'url': 'images/archive.jpg', 'width': 640, 'height': 480,
+                'create_date': now - timedelta(hours=2), 'id': 17, 'utc_offset': None}
 
     view.getLatestImage = get_image
-    view.setLiveFile = lambda *args, **kwargs: scope['setLiveFile'](view, *args, **kwargs)
+    for name in method_names[1:]:
+        setattr(view, name, scope[name].__get__(view))
     file = tmp_path / 'latest.jpg'
     file.write_bytes(b'test')
     ns = int(now.timestamp() * 1e9) - 1000000000
     os.utime(file, ns=(ns, ns))
 
     app = Flask(__name__)
+    scope.update(app=app)
     app.add_url_rule('/latest', view_func=lambda: scope['get_objects'](view))
     return app.test_client(), view, file, calls
 
@@ -118,3 +148,120 @@ def test_sun_altitude_is_evaluated_for_each_live_request(hour, night):
     view = SimpleNamespace(camera=SimpleNamespace(latitude=45, longitude=0, elevation=0, nightSunAlt=-6))
     scope['getSunSetDate'](view)
     assert view.camera_is_night is night
+
+
+def test_opted_in_page_can_open_old_frame_and_keep_it_while_paused(latest):
+    client, view, _, calls = latest
+    url = '/latest?camera_id=3&live_status=1&night=auto'
+    data = client.get(url).get_json()
+    image = data['latest_image']
+    assert image['frame_key'] == '3:17' and image['time_source'] == 'capture'
+    assert image['url'] == 'images/archive.jpg' and calls[-1] == (3, None, None)
+    assert datetime.fromisoformat(data['live_status']['now']).timestamp() - datetime.fromisoformat(image['captured_at']).timestamp() == 7200
+    assert data['live_status']['reason'] == 'no_recent_image'
+    view.capture_pause = True
+    view.daytime_capture_save = True
+    paused = client.get(url).get_json()
+    assert paused['latest_image']['frame_key'] == image['frame_key'] and paused['live_status']['reason'] == 'paused'
+    assert client.get('/latest?camera_id=3').get_json()['latest_image']['url'] is None
+
+
+def test_live_file_revision_time_restrictions_and_archive_guard(latest, monkeypatch):
+    client, view, file, _ = latest
+    view.camera_is_night = False
+    url = '/latest?camera_id=3&live_status=1&night=auto'
+    original = client.get(url).get_json()
+    entry = original['latest_image']
+    assert entry['time_source'] == 'file' and entry['frame_key'] == 'file:{}'.format(file.stat().st_mtime_ns)
+    assert datetime.fromisoformat(entry['captured_at']).timestamp() == file.stat().st_mtime
+    assert original['live_status']['reason'] is None
+    view.live_archive_state = {'level':BLOCKED, 'reason':'full'}
+    stat = Path.stat
+    def checked_stat(path, *args, **kwargs):
+        assert path != file, 'a web request must not probe a blocked archive'
+        return stat(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'stat', checked_stat)
+    data = client.get(url).get_json()
+    assert data['latest_image']['url'] is None and data['live_status']['reason'] == 'archive_full'
+    view.live_states['DB_CAMERA_ID'].value = '4'
+    data = client.get(url).get_json()
+    assert data['latest_image']['url'] is None and data['live_status']['reason'] == 'no_recent_image'
+
+
+@pytest.mark.parametrize(('trusted','login_disabled','admin','remote','expected','manage','sign_in'), [
+    (True, False, False, False, 'capture_recovering', False, True),
+    (False, False, False, False, 'no_recent_image', False, False),
+    (False, False, True, False, 'capture_recovering', True, False),
+    (True, True, False, False, 'capture_recovering', True, False),
+    (True, False, True, True, 'no_recent_image', False, False),
+])
+def test_diagnostic_scope_and_recovery_labels(latest, trusted, login_disabled, admin, remote, expected, manage, sign_in):
+    client, view, _, _ = latest
+    view.login_disabled = login_disabled
+    view.verify_admin_network = lambda: trusted
+    view.user.is_authenticated = view.user.is_admin = admin
+    view.local_indi_allsky = not remote
+    state = view.live_states['CAPTURE_HEALTH']
+    state.value = json.dumps({'updated': view.camera_now.timestamp(), 'recovery':'capture'})
+    url = '/latest?camera_id=3&live_status=1&night=auto'
+    status = client.get(url).get_json()['live_status']
+    assert (status['reason'], status['can_manage'], status['can_sign_in_to_manage']) == (expected, manage, sign_in)
+    if trusted and not admin and not remote:
+        view.web_nonlocal_images = True
+        assert client.get(url).get_json()['live_status']['reason'] == 'no_recent_image'
+
+
+def test_stale_worker_does_not_report_recovery_or_old_archive_state(latest):
+    client, view, _, _ = latest
+    view.live_archive_state = {'level':BLOCKED, 'reason':'full'}
+    view.live_states['CAPTURE_HEALTH'].value = json.dumps({'updated':view.camera_now.timestamp()-91, 'recovery':'image'})
+    assert client.get('/latest?camera_id=3&live_status=1').get_json()['live_status']['reason'] == 'capture_status_stale'
+    view.indi_allsky_config.update(EXPOSURE_PERIOD_DAY=150, EXPOSURE_PERIOD=30, CCD_EXPOSURE_MAX=10)
+    assert client.get('/latest?camera_id=3&live_status=1&night=0').get_json()['live_status']['stale_after_s'] == 315
+    assert client.get('/latest?camera_id=3&live_status=1&night=1').get_json()['live_status']['stale_after_s'] == 90
+
+
+def test_live_view_orders_the_repeated_hour_by_real_time(tmp_path):
+    import sqlalchemy as sa
+    from sqlalchemy.orm import Session, declarative_base
+    zone = ZoneInfo('Europe/Berlin')
+    base = declarative_base()
+    class Frame(base):
+        __tablename__ = 'test_frames'
+        id = sa.Column(sa.Integer, primary_key=True)
+        createDate = sa.Column(sa.DateTime)
+        data = sa.Column(sa.JSON)
+    engine = sa.create_engine('sqlite:///:memory:')
+    base.metadata.create_all(engine)
+    with Session(engine) as db:
+        wall = datetime(2026, 10, 25, 2, 50)
+        first = Frame(createDate=wall, data={'utc_offset':7200})
+        second = Frame(createDate=wall.replace(minute=2), data={'utc_offset':3600})
+        future = Frame(createDate=wall.replace(minute=25), data={'utc_offset':3600})
+        db.add_all([first, second, future]); db.commit()
+        now = wall.replace(minute=15, tzinfo=zone, fold=1)
+        assert latest_live_row(db.query(Frame), Frame, now).id == second.id
+        assert latest_live_row(db.query(Frame), Frame, now.replace(hour=3)).id == future.id
+        db.delete(second); db.commit()
+        assert latest_live_row(db.query(Frame), Frame, now).id == first.id
+        assert capture_time(wall, 7200, now).timestamp() < now.timestamp()
+        assert capture_time(wall, None, now.replace(hour=3)) is None
+        assert capture_time(wall.replace(month=3, day=29), None, now) is None
+
+
+def test_anonymous_live_view_respects_archive_auth_while_authenticated_can_open_old_frame(latest):
+    client, view, _, _ = latest
+    view.daytime_capture_save = True
+    client.application.config['INDI_ALLSKY_AUTH_MEDIA_VIEWS'] = True
+    url = '/latest?camera_id=3&live_status=1'
+    assert client.get(url).get_json()['latest_image']['url'] is None
+    view.capture_pause = True
+    assert client.get(url).get_json()['latest_image']['url'] is None
+    view.user.is_authenticated = True
+    assert client.get(url).get_json()['latest_image']['url'] == 'images/archive.jpg'
+    view.capture_pause = False
+    view.user.is_authenticated = False
+    # The same public live page still serves a recent authorized live frame.
+    get = view.getLatestImage
+    view.getLatestImage = lambda *a, **kw: {**get(*a, **kw), 'create_date':view.camera_now-timedelta(seconds=20)}
+    assert client.get(url).get_json()['latest_image']['frame_key'] == '3:17'

@@ -8,7 +8,7 @@ const vm = require('node:vm');
 
 const staticDir = path.resolve(__dirname, '../../indi_allsky/flask/static/js');
 
-function browser(view) {
+function browser(view, {sidebar = false, livePath = 'latest'} = {}) {
     let now = 0, nextId = 0;
     const timers = new Map(), elements = new Map(), requests = [], images = [], displays = [], draws = [];
     const handlers = new Map();
@@ -26,6 +26,7 @@ function browser(view) {
             this.value = '';
             this.style = {setProperty() {}};
             this.classList = {toggle() {}};
+            this.dataset = {};
         }
         addEventListener(type, callback) { this[type] = callback; }
         getContext() { return {drawImage: image => draws.push(image.src)}; }
@@ -46,9 +47,11 @@ function browser(view) {
         return elements.get(id);
     }
     el('companion').dataset = {cameraId: '3', refreshMs: '30000', staleMs: '90000', endpoint: '/indi-allsky/js/companion?camera_id=3'};
-    el('live-view').dataset = {interval: '31000', endpoint: '/indi-allsky/js/latest?camera_id=3&night=auto'};
+    el('live-view').dataset = {interval: '31000', endpoint: '/indi-allsky/js/' + livePath + '?camera_id=3&night=auto'};
+    if (sidebar) el('sidebar-live-status').dataset = {endpoint: '/indi-allsky/js/latest?camera_id=3&night=auto'};
     const document = {baseURI: 'https://camera.test/indi-allsky/', hidden: false, addEventListener: listen,
-        getElementById: el, createElement: () => new Element(), createTextNode: text => text, querySelector: el};
+        getElementById: id => (id === 'live-view' && view === 'sidebar') || (id === 'sidebar-live-status' && !sidebar) ? null : el(id),
+        createElement: () => new Element(), createTextNode: text => text, querySelector: el};
     function schedule(callback, delay, repeat = false) {
         const id = ++nextId;
         timers.set(id, {callback, delay, at: now + delay, repeat});
@@ -114,6 +117,141 @@ for (const view of ['image', 'canvas']) {
         assert.equal(b.requests[1].options.cache, 'no-store');
     });
 }
+
+const detailed = (url, capturedAt, reason = null, now = '2026-11-08T03:05:00+01:00') => ({
+    latest_image: {url, message: '', captured_at: capturedAt, frame_key: capturedAt, time_source: 'capture'},
+    live_status: {now, stale_after_s: 90, reason, can_manage: false},
+});
+
+for (const view of ['image', 'canvas']) {
+    test(view + ': age and camera time describe only the displayed frame, including while offline', async () => {
+        const b = browser(view, {sidebar: true});
+        assert.equal(b.requests.length, 1);
+        assert.equal(b.requests[0].url.searchParams.get('live_status'), '1');
+        const first = detailed('first', '2026-11-08T03:02:00+01:00');
+        b.requests[0].reply(first); await b.flush();
+        assert.equal(b.el('live-age').textContent, 'Waiting for image');
+        b.images[0].onload();
+        assert.equal(b.el('live-age').textContent, 'Last image 3 min ago');
+        assert.equal(b.el('live-server').textContent, 'camera server reachable');
+        assert.equal(b.el('live-time').textContent, '2026-11-08 03:02:00 UTC+01:00');
+        assert.match(b.el('sidebar-live-status').textContent, /3 min ago/);
+        await b.advance(5000);
+        const next = detailed('next', first.live_status.now, null, '2026-11-08T03:05:05+01:00');
+        b.requests[1].reply(next); await b.flush();
+        assert.equal(b.el('live-time').dateTime, first.latest_image.captured_at);
+        b.images[1].onload();
+        assert.equal(b.el('live-time').dateTime, next.latest_image.captured_at);
+        assert.equal(b.el('live-age').textContent, 'Last image 5 s ago');
+        assert.equal(b.el('sidebar-live-status').textContent, 'Last image 5 s ago · camera server reachable');
+        await b.advance(5000); b.requests[2].fail(); await b.flush();
+        await b.advance(1000);
+        assert.equal(b.el('live-age').textContent, 'Last image 11 s ago');
+        assert.equal(b.el('live-server').textContent, 'camera server unreachable');
+        assert.equal(b.el('live-retry').hidden, false);
+        b.el('live-retry').click();
+        b.requests[3].reply(detailed('next', next.latest_image.captured_at, 'processing', '2026-11-08T03:05:11+01:00'));
+        await b.flush();
+        assert.equal(b.images.length, 2);
+        assert.equal(b.el('live-server').textContent, 'camera server reachable');
+        assert.equal(b.el('message').textContent, '');
+        assert.equal(b.el('live-retry').hidden, true);
+    });
+}
+
+test('specific remedies require a current authorization, and deliberate pauses are never retried manually', async () => {
+    const b = browser('image', {sidebar: true});
+    const pause = detailed(null, null, 'paused');
+    const update = async data => {
+        b.emit('online'); b.requests.at(-1).reply(data); await b.flush();
+    };
+    b.requests[0].reply(pause); await b.flush();
+    assert.equal(b.el('message').textContent, 'Capture is paused.');
+    assert.equal(b.el('live-settings').hidden, true);
+    assert.equal(b.el('live-retry').hidden, true);
+    assert.match(b.el('sidebar-live-status').textContent, /capture paused/);
+    assert.doesNotMatch(b.el('sidebar-live-status').textContent, /settings/i);
+    pause.live_status.can_sign_in_to_manage = true;
+    await update(pause);
+    assert.equal(b.el('live-login').hidden, false);
+    assert.equal(b.el('live-settings').hidden, true);
+    pause.live_status.can_sign_in_to_manage = false;
+    pause.live_status.can_manage = true;
+    await update(pause);
+    assert.equal(b.el('live-settings').hidden, false);
+    pause.live_status.reason = 'archive_readonly';
+    await update(pause);
+    assert.equal(b.el('live-settings').hidden, true);
+    assert.equal(b.el('live-services').hidden, false);
+    assert.match(b.el('message').textContent, /write access/);
+    b.emit('online'); b.requests.at(-1).reply({}, 'application/json', 403);
+    await b.flush();
+    assert.equal(b.el('live-services').hidden, true);
+    assert.equal(b.el('live-login').hidden, true);
+    assert.equal(b.el('live-retry').hidden, true);
+    b.emit('online'); b.requests.at(-1).reply({}, 'application/json', 401);
+    await b.flush();
+    assert.equal(b.el('live-login').hidden, false);
+});
+
+test('ambiguous camera timestamps do not inherit the timestamp or age of the previous frame', async () => {
+    const b = browser('image');
+    b.requests[0].reply(detailed('first', '2026-11-08T03:04:59+01:00')); await b.flush();
+    b.images[0].onload();
+    const entry = detailed('ambiguous', null);
+    entry.latest_image.frame_key = 'image:2';
+    await b.advance(5000); b.requests[1].reply(entry); await b.flush(); b.images[1].onload();
+    assert.equal(b.el('live-time').hidden, true);
+    assert.equal(b.el('live-age').textContent, 'Image time unknown');
+});
+
+test('a clock correction never turns a genuinely future displayed timestamp into a freshly captured image', async () => {
+    const b = browser('image', {sidebar: true});
+    const captured = '2026-11-08T03:05:01+01:00';
+    b.requests[0].reply(detailed('shown.jpg', captured));
+    await b.flush(); b.images[0].onload();
+    assert.equal(b.el('live-age').textContent, 'Last image 0 s ago');
+    await b.advance(5000);
+    b.requests[1].reply(detailed(null, null, 'no_recent_image', '2026-11-08T02:55:05+01:00'));
+    await b.flush();
+    assert.equal(b.el('live-age').textContent, 'Image time ahead of camera');
+    assert.equal(b.el('live-time').dateTime, captured);
+    assert.match(b.el('message').textContent, /Check the camera time and time zone/);
+    assert.equal(b.el('live-retry').hidden, false);
+    assert.equal(b.el('sidebar-live-status').textContent, 'Image time ahead of camera · check clock');
+    b.el('live-retry').click();
+    b.requests[2].reply(detailed('new-frame.jpg', '2026-11-08T02:55:05+01:00', null, '2026-11-08T02:55:08+01:00'));
+    await b.flush(); b.images[1].onload();
+    assert.equal(b.el('live-age').textContent, 'Last image 3 s ago');
+    assert.equal(b.el('message').textContent, '');
+    assert.equal(b.el('live-retry').hidden, true);
+});
+
+test('on other pages the sidebar polls JSON at a low rate without downloading images', async () => {
+    const b = browser('sidebar', {sidebar: true});
+    b.requests[0].reply(detailed('not-fetched', '2026-11-08T03:04:57+01:00'));
+    await b.flush();
+    assert.equal(b.el('sidebar-live-status').textContent, 'Last image 3 s ago · camera server reachable');
+    await b.advance(12000);
+    assert.equal(b.requests.length, 1);
+    assert.equal(b.el('sidebar-live-status').textContent, 'Last image 15 s ago · camera server reachable');
+    await b.advance(3000);
+    assert.equal(b.requests.length, 2);
+    assert.equal(b.images.length, 0);
+});
+
+test('panorama polls and sidebar capture polls remain independent', async () => {
+    const b = browser('canvas', {sidebar: true, livePath:'latest_panorama'});
+    assert.equal(b.requests.length, 2);
+    b.requests[0].reply(detailed('panorama.jpg', '2026-11-08T03:01:00+01:00'));
+    b.requests[1].reply(detailed('normal.jpg', '2026-11-08T03:04:51+01:00', 'capture_recovering'));
+    await b.flush();
+    b.images[0].onload();
+    assert.equal(b.el('live-age').textContent, 'Last image 4 min ago');
+    assert.equal(b.el('sidebar-live-status').textContent, 'Last image 9 s ago · recovering capture');
+    assert.deepEqual(b.draws, ['panorama.jpg']);
+    assert.equal(b.images.length, 1);
+});
 
 test('a slow completed frame displays before the newest queued frame; a failed image retains it', async () => {
     const b = browser('image');

@@ -1,0 +1,16 @@
+<div id="live-status" class="live-status tw:bg-base-200 tw:text-base-content">
+    <div class="live-summary">
+        <span><span id="live-age">Waiting for image</span> · <span id="live-server">checking camera server</span></span>
+        <time id="live-time" hidden></time>
+    </div>
+    <div class="live-detail">
+        <span id="message" role="status"></span>
+        <button type="button" class="tw:btn tw:btn-sm tw:btn-outline" id="live-retry" hidden>Retry now</button>
+        <a class="tw:btn tw:btn-sm tw:btn-outline" id="live-login"
+           href="{{ url_for('auth_indi_allsky.login_view', next=request.full_path.rstrip('?')) }}" hidden>Sign in</a>
+        {% if login_disabled or (current_user.is_authenticated and current_user.is_admin) %}
+        <a class="tw:btn tw:btn-sm tw:btn-outline" id="live-settings" href="{{ url_for('indi_allsky.config_view', _anchor='nav-image') }}" hidden>Camera settings</a>
+        <a class="tw:btn tw:btn-sm tw:btn-outline" id="live-services" href="{{ url_for('indi_allsky.system_view', _anchor='tab-services') }}" hidden>System services</a>
+        {% endif %}
+    </div>
+</div>
