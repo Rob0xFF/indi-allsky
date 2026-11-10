@@ -458,6 +458,24 @@ test('companion image checks proceed through repeated or slow detail failures', 
     assert.equal(b.displays.length, 5);
 });
 
+test('companion reports orientation only on a current reply from an enabled camera', async () => {
+    const b = browser('companion');
+    const orientation = b.el('orientation');
+    b.requests[0].reply({...status(null), orientation: 'pending'});
+    b.requests[1].reply(full(null)); await b.flush();
+    assert.equal(orientation.textContent, 'Orientation pending');
+    assert.equal(orientation.hidden, false);
+    await b.advance(2000);
+    b.requests.at(-1).reply({...status(null), orientation: 'aligned'}); await b.flush();
+    assert.equal(orientation.textContent, 'Aligned by stars');
+    await b.advance(2000); b.requests.at(-1).fail(); await b.flush();
+    assert.equal(orientation.hidden, true);
+    b.emit('online');
+    b.requests.at(-2).reply(status(null)); b.requests.at(-1).reply(full(null)); await b.flush();
+    assert.equal(orientation.hidden, true);
+    assert.equal(orientation.textContent, '');
+});
+
 test('companion differentiates missing, transferring, paused, offline and authentication states', async () => {
     const b = browser('companion');
     let read = b.requests[0];

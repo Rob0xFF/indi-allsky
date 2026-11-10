@@ -264,6 +264,14 @@
         clock = {timestamp, syncedAt: performance.now(), offset: payload.offset_minutes || 0};
     }
 
+    function showOrientation(state) {
+        const label = byId('orientation');
+        if (!label) return;
+        const text = state === 'aligned' ? 'Aligned by stars' : state === 'pending' ? 'Orientation pending' : '';
+        if (label.textContent !== text) label.textContent = text;
+        label.hidden = !text;
+    }
+
     function serviceError(issue, code, details) {
         if (issue === 'login') return 'Sign in again to view camera data';
         if (issue === 'forbidden') return 'Access to camera data denied';
@@ -283,10 +291,12 @@
         capturePaused = payload.capture_paused === true;
         archiveIssue = archiveMessages[payload.archive] || '';
         upsUnreadable = payload.ups_unreadable === true;
+        showOrientation(payload.orientation);
         updateImage(payload.image);
         imageServiceMessage = '';
         tick();
     }, (issue, code) => {
+        showOrientation(null);
         imageServiceMessage = serviceError(issue, code, false);
         if (!displayed) byId('empty-image').textContent = 'Image unavailable';
         updateStatus();

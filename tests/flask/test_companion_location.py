@@ -148,3 +148,35 @@ def test_local_archive_unavailable_keeps_status_available(functions, monkeypatch
     data = app.test_client().get('/status?camera_id=3&image_only=1').get_json()
     assert data['archive'] == 'mount' and data['image'] is None
     assert '/private/path' not in str(data)
+
+
+@pytest.mark.parametrize('local,visible,enabled,active,reported', [
+    (True, True, True, '3', 'pending'),
+    (True, True, True, '3', 'aligned'),
+    (False, True, True, '3', None),
+    (True, False, True, '3', None),
+    (True, True, False, '3', None),
+    (True, True, True, '4', None),
+    (True, True, True, None, None),
+])
+def test_alignment_is_scoped_to_active_local_camera(functions, monkeypatch, local, visible, enabled, active, reported):
+    app = Flask(__name__)
+    view = view_for(functions, 45, 10, False)
+    camera = view.getCameraById(3)
+    camera.local = local
+    camera.uuid = 'active-camera'
+    view.local_images_allowed = visible
+    view.live_states = {'DB_CAMERA_ID': SimpleNamespace(value=active)} if active else {}
+    view.indi_allsky_config['CARDINAL_DIRS'] = {'AUTO_ALIGN': enabled}
+
+    def read_status(config, uuid):
+        assert uuid == camera.uuid and reported is not None
+        return reported
+
+    monkeypatch.setitem(functions.companion_status.__globals__, 'read_alignment_status', read_status)
+    app.add_url_rule('/status', view_func=lambda: functions.companion_status(view))
+    data = app.test_client().get('/status?camera_id=3&image_only=1').get_json()
+    if reported is None:
+        assert 'orientation' not in data
+    else:
+        assert data['orientation'] == reported

@@ -6,6 +6,7 @@ from sqlalchemy.orm.exc import NoResultFound
 
 from ..archive_health import archive_state, BLOCKED
 from ..sensor_health import ups_problem
+from ..star_alignment import read_alignment_status
 from ..companion_astronomy import camera_timezone, night_ephemeris
 from .base_views import BaseView
 from .companion_charts import companion_charts
@@ -59,6 +60,10 @@ def companion_status(view):
     if shows_local_archive:
         # Only the code leaves the Pi. Mount paths and host details stay local.
         data['archive'] = archive.get('reason', 'ok')
+        if view.indi_allsky_config.get('CARDINAL_DIRS', {}).get('AUTO_ALIGN'):
+            active = view.live_states.get('DB_CAMERA_ID')
+            if active is not None and active.value == str(view.camera.id):
+                data['orientation'] = read_alignment_status(view.indi_allsky_config, view.camera.uuid)
     # The browser can discover a published frame promptly without recomputing
     # two hours of sensor readings and the ephemerides on each image check.
     if shows_local_archive:

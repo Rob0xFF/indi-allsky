@@ -173,3 +173,16 @@ def test_a_failed_startrail_encode_preserves_the_finished_stills(station,monkeyp
     assert media.reconcile(w,c,day,True)
     assert Keogram.query.one().success and Startrail.query.one().success and not StarMovie.query.count()
     assert not media.reconcile(w,c,day,True)
+
+
+def test_stack_does_not_mix_manual_pending_and_registered_exposures(station):
+    _, camera, _, _, _, frames = station
+    frames(3)
+    images = Frame.query.filter_by(camera_id=camera.id).order_by(Frame.id)
+    legacy, pending, aligned = images.all()
+    pending.data = {'star_alignment': None}
+    db.session.commit()
+    assert list(media.registered_entries(images)) == [legacy, aligned]
+    aligned.data = {'star_alignment': {'id': 'this-setup'}}
+    db.session.commit()
+    assert list(media.registered_entries(images)) == [aligned]

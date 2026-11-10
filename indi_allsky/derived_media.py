@@ -1,6 +1,7 @@
 """Rebuild only missing keograms and star-trail products of a completed period."""
 from contextlib import contextmanager
 from datetime import datetime
+from functools import partial
 import fcntl
 import hashlib
 import json
@@ -14,6 +15,7 @@ import cv2
 from PIL import Image, UnidentifiedImageError
 
 from . import constants
+from .aligned_media import SkyRemap, frame_geometry
 from .archive_health import archive_paused, require_writable_archive, storage_errno
 from . import night_movie
 from .media_probe import verified_media
@@ -65,8 +67,21 @@ def read_frame(path):
         return cv2.cvtColor(numpy.array(image), cv2.COLOR_RGB2BGR)
 
 
+def registered_entries(entries):
+    """Use one physical coordinate system in a stack, including during archive repair."""
+    from .flask.models import IndiAllSkyDbImageTable as Frame
+    # Look for calibrated frames before processing any legacy or pending images.
+    calibrated = entries.filter(Frame.data['star_alignment']['id'].as_string().isnot(None))
+    if calibrated.first() is not None:
+        return calibrated
+    # Legacy manual frames remain usable. An explicit JSON null is a frame
+    # from an unconfirmed setup. JSON null and a missing key differ by dialect.
+    return [frame for frame in entries if 'star_alignment' not in (frame.data or {})]
+
+
 def process_frames(config, entries, kg, stg, checkpoint=None):
     """Use the same ordered sources, skip and quality filters as normal generation."""
+    remap = SkyRemap()
     for i, entry in enumerate(entries):
         if i % 50 == 0:
             logger.info('Processing frame %d for keogram / star trails', i)
@@ -84,15 +99,24 @@ def process_frames(config, entries, kg, stg, checkpoint=None):
             continue
         if data is None:
             continue
+        metadata = getattr(entry, 'data', None)
+        solution = frame_geometry(metadata, (data.shape[1], data.shape[0]))
+        if isinstance(metadata, dict) and 'star_alignment' in metadata and not solution:
+            continue
         if kg is not None:
             try:
-                kg.processImage(data, path.stat().st_mtime)
+                strip_image = data
+                if solution:
+                    kg.x_offset = kg.y_offset = 0
+                    strip_image = remap.image(data, solution)
+                kg.processImage(strip_image, path.stat().st_mtime)
             except KeogramMismatchException as exc:
                 logger.warning('Skipping incompatible keogram image: %s', exc)
         if stg is not None:
             saved = config.get('STARTRAILS_USE_DB_DATA', True)
             stg.processImage(path, data, entry.binmode, adu=entry.adu if saved else None,
-                             star_count=entry.stars if saved else None)
+                             star_count=entry.stars if saved else None,
+                             align=partial(remap.image, solution=solution) if solution else None)
 
 
 def key(camera_id, date, night):
@@ -201,7 +225,7 @@ def render(worker, camera, date, night, entries, missing, scratch):
     def checkpoint():
         if worker._shutdown or archive_paused(cfg):
             raise RepairPaused
-    process_frames(cfg, entries, kg, stg, checkpoint)
+    process_frames(cfg, registered_entries(entries), kg, stg, checkpoint)
     checkpoint()
     completed = {}
     fmt = cfg['IMAGE_FILE_TYPE']

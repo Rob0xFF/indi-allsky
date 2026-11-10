@@ -18,6 +18,7 @@ import logging
 
 import ephem
 
+from .aligned_media import frame_geometry
 from . import constants
 from .archive_health import (archive_paused, DEFERRED, VIDEO_ACTIONS, ArchiveUnavailable,
                              require_writable_archive, space_failure, storage_errno)
@@ -657,6 +658,7 @@ class VideoWorker(Process):
         logger.info('Max kpindex: %0.2f, ovation: %d, smoke rating: %s', max_kpindex, max_ovation_max, constants.SMOKE_RATING_MAP_STR[max_smoke_rating])
 
 
+        frame_alignments = {}
         timelapse_files = list()
         for entry in timelapse_files_entries:
             p_entry = Path(entry.getFilesystemPath())
@@ -669,8 +671,14 @@ class VideoWorker(Process):
                 continue
 
             timelapse_files.append(p_entry)
+            alignment = frame_geometry(entry.data, (entry.width, entry.height))
+            if alignment:
+                frame_alignments[p_entry] = alignment
 
 
+        if frame_alignments:
+            # Never splice an unconfirmed camera pose into a registered sky.
+            timelapse_files = [p for p in timelapse_files if p in frame_alignments]
         timelapse_skip_frames = self.config.get('TIMELAPSE_SKIP_FRAMES', 4)
         if repair:
             timelapse_files = list(night_movie.readable_images(timelapse_files))
@@ -752,6 +760,7 @@ class VideoWorker(Process):
             tg.vf_scale = vf_scale
             tg.ffmpeg_extra_options = ffmpeg_extra_options
 
+            tg.pre_processor.frame_alignments = frame_alignments
             tg.pre_processor.keogram = keogram_filename
             tg.pre_processor.pre_scale = self.config.get('TIMELAPSE', {}).get('PRE_SCALE', 50)
 
@@ -1030,6 +1039,7 @@ class VideoWorker(Process):
 
 
         timelapse_files = list()
+        frame_alignments = {}
         panorama_frame_timestamps = list()
         for entry in mini_timelapse_files_entries:
             try:
@@ -1040,6 +1050,12 @@ class VideoWorker(Process):
                 logger.error('File not found: %s', entry.filename)
                 continue
 
+            if panorama:
+                # A user-selected crop is in the coordinate system of its anchor.
+                geo = (entry.data or {}).get('panorama_projection') == 'geographic'
+                anchor_geo = (panorama_image_entry.data or {}).get('panorama_projection') == 'geographic'
+                if geo != anchor_geo:
+                    continue
             if panorama and (entry.width != source_width or entry.height != source_height):
                 message = 'Panorama dimensions changed within the selected time range'
                 logger.error(
@@ -1054,10 +1070,16 @@ class VideoWorker(Process):
                 return
 
             timelapse_files.append(p_entry)
+            if not panorama:
+                alignment = frame_geometry(entry.data, (entry.width, entry.height))
+                if alignment:
+                    frame_alignments[p_entry] = alignment
             if panorama:
                 panorama_frame_timestamps.append(entry.createDate.timestamp())
 
 
+        if frame_alignments:
+            timelapse_files = [p for p in timelapse_files if p in frame_alignments]
         logger.info('Found %d usable images for mini timelapse', len(timelapse_files))
 
 
@@ -1262,6 +1284,7 @@ class VideoWorker(Process):
                 mini_tg.vf_scale = vf_scale
             mini_tg.ffmpeg_extra_options = ffmpeg_extra_options
 
+            mini_tg.pre_processor.frame_alignments = frame_alignments
             mini_tg.generate(video_file, timelapse_files, preserve_order=True)
 
 
@@ -1277,7 +1300,7 @@ class VideoWorker(Process):
 
             mini_video_entry.success = True
             db.session.commit()
-        except TimelapseException:
+        except (TimelapseException, OSError):
             self._miscDb.addNotification(
                 NotificationCategory.MEDIA,
                 'mini_timelapse_video',
@@ -1399,6 +1422,10 @@ class VideoWorker(Process):
             .order_by(IndiAllSkyDbPanoramaImageTable.createDate.asc(), IndiAllSkyDbPanoramaImageTable.id.asc())
 
 
+        geographic = timelapse_files_entries.filter(
+            IndiAllSkyDbPanoramaImageTable.data['panorama_projection'].as_string() == 'geographic')
+        if geographic.first() is not None:
+            timelapse_files_entries = geographic
         timelapse_files_entries_count = timelapse_files_entries.count()
         logger.info('Found %d images for timelapse', timelapse_files_entries_count)
 
@@ -1645,6 +1672,24 @@ class VideoWorker(Process):
         )
 
 
+        # find all files
+        files_entries = IndiAllSkyDbImageTable.query\
+            .join(IndiAllSkyDbImageTable.camera)\
+            .filter(IndiAllSkyDbCameraTable.id == camera.id)\
+            .filter(IndiAllSkyDbImageTable.dayDate == d_dayDate)\
+            .filter(IndiAllSkyDbImageTable.night == night)\
+            .filter(IndiAllSkyDbImageTable.exclude == sa_false())\
+            .order_by(IndiAllSkyDbImageTable.createDate.asc())
+
+
+        files_entries = derived_media.registered_entries(files_entries)
+        image_count = len(files_entries) if isinstance(files_entries, list) else files_entries.count()
+        if image_count <= self.config.get('TIMELAPSE_SKIP_FRAMES', 4):
+            task.setFailed('Insufficient oriented source images for keogram and star trails')
+            return
+        logger.info('Found %d images for keogram/star trails', image_count)
+
+
         try:
             # delete old keogram entry if it exists
             old_keogram_entry = IndiAllSkyDbKeogramTable.query\
@@ -1746,20 +1791,6 @@ class VideoWorker(Process):
         if startrail_video_file.exists():
             logger.warning('Removin orphaned Star trail timelapse file: %s', startrail_video_file)
             startrail_video_file.unlink()
-
-
-        # find all files
-        files_entries = IndiAllSkyDbImageTable.query\
-            .join(IndiAllSkyDbImageTable.camera)\
-            .filter(IndiAllSkyDbCameraTable.id == camera.id)\
-            .filter(IndiAllSkyDbImageTable.dayDate == d_dayDate)\
-            .filter(IndiAllSkyDbImageTable.night == night)\
-            .filter(IndiAllSkyDbImageTable.exclude == sa_false())\
-            .order_by(IndiAllSkyDbImageTable.createDate.asc())
-
-
-        image_count = files_entries.count()
-        logger.info('Found %d images for keogram/star trails', image_count)
 
 
         # some of these values might be NULL which might cause other problems
