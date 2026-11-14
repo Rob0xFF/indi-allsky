@@ -297,6 +297,8 @@ def _fitLensModel(detections, initial, width, height, project, seed, scale):
 # together for sky products, which use both to position their cardinal points.
 NEAR_ZENITH_ALTITUDE = 85.0
 MAX_ALIGNMENT_CHANGE_DEG = 0.2
+MAX_HORIZON_SHIFT_FRACTION = 0.005
+MAX_ALIGNMENT_RMS_FRACTION = 0.001
 
 
 def _alignmentDelta(first, second):
@@ -308,6 +310,15 @@ def _alignmentDelta(first, second):
     axis_change = numpy.degrees(axes[0]-axes[1])
     roll_change = (first[2]-second[2]+180) % 360-180
     return numpy.r_[axis_change, roll_change]
+
+
+def _horizonPoints(params, pose, width, height):
+    # Evaluate the physical horizon even when the sensor crops these points.
+    physical = params.copy()
+    physical[0] = pose[2]
+    azimuths = numpy.radians([0., 90., 180., 270.])
+    return numpy.column_stack(projectToPixels(numpy.zeros(4), azimuths, physical,
+        width, height, lens_altitude=pose[0], pointing_azimuth=pose[1]))
 
 
 def _validateLensModel(fit, detections, width, height, project, pointing, for_sky_alignment):
@@ -348,31 +359,29 @@ def _validateLensModel(fit, detections, width, height, project, pointing, for_sk
     altitude, heading, _ = pose
     near_zenith_alignment = for_sky_alignment and altitude >= NEAR_ZENITH_ALTITUDE
 
-    # Manual calibration reports the tilt heading. Automatic products near the
-    # zenith instead require the optical axis and the image roll to be stable.
-    # SVD preserves weak directions in the fitted parameter covariance.
+    # Keep the original heading test for manual calibration. For automatic
+    # sky products also propagate uncertainty in the physical pointing and roll.
     steps = numpy.array([1e-4]*3+[0.01]*3+[1e-5])[:len(result.x)]
-    gradient = []
+    heading_gradient, alignment_gradient = [], []
     for direction, step in zip(numpy.eye(len(steps)), steps):
         a = pointing(expand(result.x+direction*step))
         b = pointing(expand(result.x-direction*step))
+        heading_gradient.append(((a[1]-b[1]+180) % 360-180)/(2*step))
         if near_zenith_alignment:
-            change = _alignmentDelta(a, b)
-        else:
-            change = numpy.array([(a[1]-b[1]+180) % 360-180])
-        gradient.append(change/(2*step))
+            alignment_gradient.append(_alignmentDelta(a, b)/(2*step))
     _, singular, vt = numpy.linalg.svd(result.jac, full_matrices=False)
     if singular[-1] <= numpy.finfo(float).eps*singular[0]*max(result.jac.shape):
         return None
-    propagated = (vt @ gradient) / singular[:, None]
-    sigma = numpy.linalg.norm(propagated, ord=2) * numpy.sqrt(numpy.sum(result.fun**2)/(n-len(result.x)))
-    # Two standard deviations along the least certain direction of the pose.
-    uncertainty = min(180., float(2*sigma))
-    if near_zenith_alignment:
-        if uncertainty > MAX_ALIGNMENT_CHANGE_DEG:
-            return None
-    elif altitude < 89 and uncertainty > 2:
+    noise = numpy.sqrt(numpy.sum(result.fun**2)/(n-len(result.x)))
+    uncertainty = min(180., float(2*noise*numpy.linalg.norm(vt @ heading_gradient / singular)))
+    heading_stable = altitude >= 89 or uncertainty <= 2
+    if not heading_stable and not near_zenith_alignment:
         return None
+
+    if near_zenith_alignment:
+        horizon = _horizonPoints(p, pose, width, height)
+        propagated = (vt @ alignment_gradient) / singular[:, None]
+        alignment_stable = 2*noise*numpy.linalg.norm(propagated, ord=2) <= MAX_ALIGNMENT_CHANGE_DEG
 
     median = numpy.median(target, axis=0)
     sectors = (target[:, 0] > median[0]).astype(int)+2*(target[:, 1] > median[1])
@@ -382,17 +391,27 @@ def _validateLensModel(fit, detections, width, height, project, pointing, for_sk
             return None
         subset = least_squares(lambda q: residual(expand(q))[keep], result.x,
             bounds=(lower[:len(result.x)], upper[:len(result.x)]), **options)
-        sub_pose = pointing(expand(subset.x))
+        sub_params = expand(subset.x)
+        sub_pose = pointing(sub_params)
         if not subset.success or abs(sub_pose[0]-altitude) > 0.1:
             return None
-        if near_zenith_alignment:
-            if numpy.linalg.norm(_alignmentDelta(sub_pose, pose)) > MAX_ALIGNMENT_CHANGE_DEG:
+        if altitude < 89 and abs((sub_pose[1]-heading+180) % 360-180) > 2:
+            heading_stable = False
+            if not near_zenith_alignment:
                 return None
-        elif altitude < 89 and abs((sub_pose[1]-heading+180) % 360-180) > 2:
-            return None
+        if near_zenith_alignment and alignment_stable:
+            alignment_stable = numpy.linalg.norm(_alignmentDelta(sub_pose, pose)) <= MAX_ALIGNMENT_CHANGE_DEG
+            drift = _horizonPoints(sub_params, sub_pose, width, height)-horizon
+            if numpy.max(numpy.linalg.norm(drift, axis=1)) > MAX_HORIZON_SHIFT_FRACTION*p[3]:
+                alignment_stable = False
 
     rms = numpy.sqrt(numpy.mean(numpy.sum(residual(p).reshape(-1, 2)**2, axis=1)))
+    if not heading_stable:
+        # A departure from the manual heading contract needs a precise fit at
+        # the scale of the complete image circle. In particular, a mismatched
+        # radial lens model can look stable over just the middle of the sensor.
+        if not alignment_stable or rms > MAX_ALIGNMENT_RMS_FRACTION*p[3]:
+            return None
     validated = fitting._buildFitResult(p, len(ci), rms, fit['final_match_radius'], False)
-    if not near_zenith_alignment:
-        validated['azimuth_uncertainty_deg'] = uncertainty
+    validated['azimuth_uncertainty_deg'] = uncertainty
     return validated if validated['success'] else None
