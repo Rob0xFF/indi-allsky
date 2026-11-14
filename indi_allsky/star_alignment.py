@@ -71,7 +71,7 @@ def solve_frame(request):
     solver = IndiAllSkyLensSolver(config)
     args = (request['path'], *request['location'], request['timestamp'], values)
     hints = dict(lens_altitude=values['LENS_ALTITUDE'], pointing_azimuth=values['POINTING_AZIMUTH'],
-                 sensor_shape=request['sensor_shape'], binning=request['binning'])
+                 sensor_shape=request['sensor_shape'], binning=request['binning'], for_sky_alignment=True)
     result = solver.solve(*args, **hints)
     if not result.get('success'):
         reason = result.get('reason')

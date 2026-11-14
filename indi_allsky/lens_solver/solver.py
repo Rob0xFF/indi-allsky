@@ -119,7 +119,8 @@ class IndiAllSkyLensSolver(object):
             self._fit_s = engine.fit_s
 
     def solve(self, image_file, latitude, longitude, obstime_unix, initial_values,
-              lens_altitude=90.0, pointing_azimuth=0.0, sensor_shape=None, binning=1, *, max_work_pixels=None, stationary_reference=None):
+              lens_altitude=90.0, pointing_azimuth=0.0, sensor_shape=None, binning=1, *,
+              max_work_pixels=None, stationary_reference=None, for_sky_alignment=False):
         """Fit overlay geometry, recovering camera pointing when needed.
         initial_values/values use the VirtualSky form-field keys; every
         return is a full success or a structured failure, always with a
@@ -293,7 +294,8 @@ class IndiAllSkyLensSolver(object):
                 if not candidate['success'] or candidate.get('partial'):
                     continue
                 refined = refineLensModel(detections, catalog, latitude, longitude,
-                    obstime_unix, candidate['params'], work_width, work_height, altitude, heading)
+                    obstime_unix, candidate['params'], work_width, work_height, altitude, heading,
+                    for_sky_alignment=for_sky_alignment)
                 if refined is not None:
                     fit, lens_altitude, pointing_azimuth = refined, altitude, heading
                     break
