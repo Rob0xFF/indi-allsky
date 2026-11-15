@@ -1,7 +1,8 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from flask import abort, render_template, request, session
+from flask import abort, jsonify, make_response, render_template, request, session
+from sqlalchemy import or_
 from sqlalchemy.orm.exc import NoResultFound
 
 from ..archive_health import archive_state, BLOCKED
@@ -9,6 +10,7 @@ from ..sensor_health import ups_problem
 from ..star_alignment import read_alignment_status
 from ..companion_astronomy import camera_timezone, night_ephemeris
 from ..companion_battery import battery_reading
+from ..companion_targets import marker_coordinates, project_targets, resolve_coordinates, resolve_name
 from .base_views import BaseView
 from .companion_charts import companion_charts, sensor_probes
 from .misc import login_optional_media
@@ -45,6 +47,8 @@ def companion_status(view):
     view.cameraSetup(camera_id=camera_id, include_sunset=False)
     if view.camera.id < 1:
         abort(404)
+    if any(key in request.args for key in ('resolve', 'ra', 'dec', 'frame', 'target')):
+        return companion_target_request(view)
 
     zone = camera_timezone(view.camera)
     now = datetime.now(timezone.utc).astimezone(zone)
@@ -90,6 +94,47 @@ def companion_status(view):
     return data
 
 
+def companion_target_request(view):
+    try:
+        if 'resolve' in request.args:
+            return {'target': resolve_name(request.args['resolve'])}
+        if 'ra' in request.args or 'dec' in request.args:
+            return {'target': resolve_coordinates(request.args.get('ra'), request.args.get('dec'))}
+        frame = request.args.get('frame', type=int)
+        if frame is None or not 0 < frame <= 2**63 - 1:
+            raise ValueError('Invalid image ID.')
+        coordinates = marker_coordinates(request.args.getlist('target'))
+    except ValueError as exc:
+        abort(make_response(jsonify(error=str(exc)), 400))
+
+    result = {'frame': frame, 'state': 'unavailable', 'points': [None] * len(coordinates)}
+    query = view.model.query.filter_by(camera_id=view.camera.id, id=frame)
+    if not view.local_images_allowed:
+        query = query.filter(or_(view.model.remote_url != '', view.model.s3_key != ''))
+    entry = query.first()
+    if entry is None:
+        return result
+    try:
+        url = entry.getUrl(s3_prefix=view.s3_prefix, local=view.local_images_allowed)
+    except ValueError:
+        return result
+    if not url or (isinstance(url, Path) and url.is_absolute()):
+        return result
+
+    # The companion also runs on stations without automatic stellar alignment.
+    from . import views
+    frame_alignment = getattr(views, 'virtualsky_frame_alignment', None)
+    if frame_alignment is None:
+        return result
+    model = frame_alignment(view, entry) if isinstance(entry.data, dict) else None
+    points = project_targets(coordinates, model)
+    if points is None:
+        result['state'] = 'orientation_pending'
+    else:
+        result.update(state='ready', points=points)
+    return result
+
+
 def latest_companion_image(view, now, entry):
     # Use one database entry for both the URL and its capture time. Keep the
     # last eligible image across long pauses, ignoring future-dated captures.
@@ -106,6 +151,8 @@ def latest_companion_image(view, now, entry):
             if other.utcoffset() != captured.utcoffset() and other.timestamp() <= now.timestamp():
                 captured = other
         image = {'url': entry['url'], 'captured_at': captured.isoformat(), 'time_source': 'capture'}
+        if entry.get('id') is not None:
+            image['id'] = entry['id']
 
     # Focus mode and unsaved daytime frames can exist only as latest.<ext>.
     # It is one local file for the active device, never a remote-camera asset.
