@@ -249,7 +249,8 @@ def render(worker, camera, date, night, entries, missing, scratch):
             encoder.vf_scale = cfg.get('FFMPEG_VFSCALE_STARTRAIL', '')
             encoder.ffmpeg_extra_options = cfg.get('FFMPEG_EXTRA_OPTIONS', '')
             path = scratch / ('startrail_timelapse.webm' if encoder.codec == 'libvpx' else 'startrail_timelapse.mp4')
-            encoder.generate(path, stg.timelapse_frame_list)
+            with worker.activity.during(camera.id, 'Encoding star-trail timelapse', date.strftime('%Y%m%d')):
+                encoder.generate(path, stg.timelapse_frame_list)
             completed['startrail_timelapse'] = (path, stg.timelapse_frame_count)
     return completed
 
@@ -443,7 +444,13 @@ def reconcile_locked(worker, camera, date, night):
         else:
             folder = worker._getVideoFolder(date, camera)
             with tempfile.TemporaryDirectory(prefix='.derived-', dir=folder) as tmp:
-                complete = render(worker, camera, date, night, entries, missing, Path(tmp))
+                trails = bool({'startrail', 'startrail_timelapse'}.intersection(missing))
+                if 'keogram' in missing:
+                    phase = 'Generating keogram and star trails' if trails else 'Generating keogram'
+                else:
+                    phase = 'Generating star trails'
+                with worker.activity.during(camera.id, phase, args['timespec']):
+                    complete = render(worker, camera, date, night, entries, missing, Path(tmp))
                 published = publish(worker, camera, date, night, missing, complete, name, token, frame_summary(entries))
             omitted = sorted(set(wanted) - set(published))
             message = f'{date} {"night" if night else "day"}: generated {", ".join(published) or "none"}.'
