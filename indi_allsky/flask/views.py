@@ -488,7 +488,7 @@ class JsonLatestImageView(JsonView):
                          time_source='file', frame_key='file:{}'.format(stamp.st_mtime_ns))
 
 
-    def getLatestImage(self, camera_id, history_seconds, not_after=None, *, live_now=None):
+    def getLatestImage(self, camera_id, history_seconds, not_after=None, *, live_now=None, include_sensor_data=False):
         latest_image_q = self.model.query\
             .join(self.model.camera)\
             .filter(IndiAllSkyDbCameraTable.id == camera_id)
@@ -535,6 +535,8 @@ class JsonLatestImageView(JsonView):
         if not_after is not None or live_now is not None:
             image_data['create_date'] = latest_image.createDate
             image_data['utc_offset'] = latest_image.data.get('utc_offset') if isinstance(latest_image.data, dict) else None
+        if include_sensor_data and not latest_image.exclude:
+            image_data['sensor_data'] = latest_image.data
         return image_data
 
 

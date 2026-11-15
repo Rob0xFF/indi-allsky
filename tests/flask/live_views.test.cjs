@@ -59,6 +59,7 @@ function browser(view, {sidebar = view !== 'companion', livePath = 'latest'} = {
             for (const child of children) if (child instanceof Element) child.parentElement = this;
         }
         removeAttribute(key) { delete this[key]; }
+        setAttribute(key, value) { this[key] = value; }
     }
     function el(id) {
         if (!elements.has(id)) elements.set(id, new Element(id));
@@ -515,6 +516,23 @@ test('companion clears a stale chart reading and reports an unreadable local UPS
     await b.flush();
     assert.equal(b.el('chart-slot-1.chart-value').textContent, '0 lx');
     assert.doesNotMatch(b.el('connection-message').textContent, /Cannot read UPS status/);
+});
+
+test('companion hides an absent battery, shows a genuine zero and expires the reading offline', async () => {
+    const b = browser('companion');
+    const snapshot = full(null);
+    const icon = b.el('battery');
+    b.requests[0].reply(snapshot); b.requests[1].reply(snapshot); await b.flush();
+    assert.equal(icon.hidden, true);
+    snapshot.battery = {value: 0, expires_at: '2026-11-07T21:00:12+01:00'};
+    b.emit('online');
+    b.requests.at(-2).reply(snapshot); b.requests.at(-1).reply(snapshot); await b.flush();
+    assert.equal(icon.hidden, false);
+    assert.equal(b.el('battery-value').textContent, '0%');
+    assert.equal(icon['aria-label'], 'Battery 0%');
+    await b.advance(3000);
+    assert.equal(b.el('battery-value').textContent, '–');
+    assert.equal(icon.title, 'Battery reading unavailable');
 });
 
 test('companion formats English readings and keeps the date and offset of each camera event', async () => {

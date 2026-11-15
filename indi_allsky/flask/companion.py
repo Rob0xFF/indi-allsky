@@ -8,8 +8,9 @@ from ..archive_health import archive_state, BLOCKED
 from ..sensor_health import ups_problem
 from ..star_alignment import read_alignment_status
 from ..companion_astronomy import camera_timezone, night_ephemeris
+from ..companion_battery import battery_reading
 from .base_views import BaseView
-from .companion_charts import companion_charts
+from .companion_charts import companion_charts, sensor_probes
 from .misc import login_optional_media
 
 
@@ -49,13 +50,18 @@ def companion_status(view):
     now = datetime.now(timezone.utc).astimezone(zone)
     shows_local_archive = view.local_indi_allsky and view.local_images_allowed
     archive = archive_state(view.indi_allsky_config) if shows_local_archive else {}
+    image_only = request.args.get('image_only') == '1'
+    blocked = archive.get('level') == BLOCKED
+    entry = {} if blocked else view.getLatestImage(
+        view.camera.id, None, not_after=now.replace(tzinfo=None), include_sensor_data=not image_only,
+    )
     data = {
         'camera_id': view.camera.id,
         'now': now.isoformat(),
         'time_zone': getattr(zone, 'key', None),
         'offset_minutes': int(now.utcoffset().total_seconds() / 60),
         'capture_paused': bool(view.camera.capture_pause),
-        'image': None if archive.get('level') == BLOCKED else latest_companion_image(view, now),
+        'image': None if blocked else latest_companion_image(view, now, entry),
     }
     if shows_local_archive:
         # Only the code leaves the Pi. Mount paths and host details stay local.
@@ -68,9 +74,13 @@ def companion_status(view):
     # two hours of sensor readings and the ephemerides on each image check.
     if shows_local_archive:
         data['ups_unreadable'] = ups_problem(Path('/run/indi-allsky-ups-watchdog/health.json'))
-    if request.args.get('image_only') == '1':
+    if image_only:
         return data
 
+    data['battery'] = battery_reading(
+        sensor_probes(view.camera, view.indi_allsky_config), entry.get('sensor_data'), data['image'],
+        now, view.camera, view.indi_allsky_config,
+    )
     latitude, longitude = view.getCameraPrivacyLatLong(view.camera)
     data['astronomy'] = night_ephemeris(now, zone, latitude, longitude, view.camera.elevation or 0)
     data['metrics'], data['defaults'], data['series'] = companion_charts(
@@ -80,10 +90,9 @@ def companion_status(view):
     return data
 
 
-def latest_companion_image(view, now):
+def latest_companion_image(view, now, entry):
     # Use one database entry for both the URL and its capture time. Keep the
     # last eligible image across long pauses, ignoring future-dated captures.
-    entry = view.getLatestImage(view.camera.id, None, not_after=now.replace(tzinfo=None))
     image = None
     captured = None
     if entry.get('url'):
