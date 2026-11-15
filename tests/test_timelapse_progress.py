@@ -75,7 +75,7 @@ def test_encoder_failure_clears_live_count(tmp_path):
 @pytest.mark.parametrize(('graph', 'options', 'known'), [
     ('fps=1', [], False), ('crop=30:30,select=1', [], False), ('tpad=stop_duration=1', [], False),
     ('scale=20:20', ['-vf', 'crop=16:16'], True), ('crop=16:16', ['-filter:v:0', 'fps=2'], False),
-    ('', ['-r', '10'], False), ('', ['-level', '3.1'], True),
+    ('', ['-r', '10'], False), ('', ['-lavfi', 'fps=1'], False), ('', ['-level', '3.1'], True),
     ("sendcmd=f='/tmp/pan',split=2[a][b];[a][b]hstack=2,crop@pan=w=30:h=20", [], True),
 ])
 def test_only_reports_encoder_totals_for_known_frame_preserving_filters(graph, options, known):

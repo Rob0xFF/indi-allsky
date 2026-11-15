@@ -25,7 +25,7 @@ def _preserves_frame_count(video_filter, extra_options):
         if flag in ('-vf', '-filter'):
             filters.append(next(options, ''))
         elif flag in ('-r', '-fpsmax', '-fps_mode', '-vsync', '-frames', '-vframes', '-filter_complex',
-                      '-filter_script', '-filter_complex_script', '-t', '-to', '-ss', '-progress'):
+                      '-filter_script', '-filter_complex_script', '-lavfi', '-t', '-to', '-ss', '-progress'):
             return False
 
     spatial = {'crop', 'scale', 'setsar', 'format', 'hflip', 'vflip', 'transpose', 'split', 'hstack', 'sendcmd'}
