@@ -225,7 +225,9 @@ def render(worker, camera, date, night, entries, missing, scratch):
     def checkpoint():
         if worker._shutdown or archive_paused(cfg):
             raise RepairPaused
-    process_frames(cfg, registered_entries(entries), kg, stg, checkpoint)
+    frames = registered_entries(entries)
+    count = len(frames) if isinstance(frames, list) else frames.count()
+    process_frames(cfg, worker.activity.track('Stacking frames', frames, count), kg, stg, checkpoint)
     checkpoint()
     completed = {}
     fmt = cfg['IMAGE_FILE_TYPE']
@@ -242,7 +244,7 @@ def render(worker, camera, date, night, entries, missing, scratch):
     if ('startrail_timelapse' in missing and stg is not None
             and stg.timelapse_frame_count >= cfg.get('STARTRAILS_TIMELAPSE_MINFRAMES', 250)):
         with independent_product('startrail_timelapse', cfg):
-            encoder = TimelapseGenerator(cfg, skip_frames=0)
+            encoder = TimelapseGenerator(cfg, skip_frames=0, activity=worker.activity)
             encoder.codec = cfg['FFMPEG_CODEC']
             encoder.framerate = cfg.get('FFMPEG_FRAMERATE', 25)
             encoder.bitrate = cfg['FFMPEG_BITRATE']

@@ -29,7 +29,7 @@ from .. import constants
 from ..archive_health import archive_state, BLOCKED
 from ..companion_astronomy import camera_timezone
 from ..live_status import capture_time, health_reason, latest_live_row
-from ..worker_activity import read_worker_activity
+from ..worker_activity import activity_label, read_worker_activity
 from ..sensor_health import custom_chart_values
 from ..night_movie import attempt_key, prior_attempt, suppress_repair
 from .. import asi676mc
@@ -440,9 +440,11 @@ class JsonLatestImageView(JsonView):
         if station['code'] not in ('stopped', 'down', 'unknown'):
             # A paused or disconnected camera can still have images or movies
             # in production. Show its outstanding work without claiming an exposure.
-            status['activities'] = read_worker_activity(
-                config, self.camera.id, include_capture=station['code'] in ('running', 'focus'),
+            details = read_worker_activity(
+                config, self.camera.id, include_capture=station['code'] in ('running', 'focus'), detailed=True,
             )
+            status['activity_details'] = details
+            status['activities'] = [activity_label(entry) for entry in details]
         status['can_manage'] = bool(admin or (self.login_disabled and trusted))
         status['can_sign_in_to_manage'] = bool(trusted and not self.login_disabled and not current_user.is_authenticated)
         if delayed and not reason:

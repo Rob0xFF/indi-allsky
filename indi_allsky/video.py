@@ -699,7 +699,8 @@ class VideoWorker(Process):
             timelapse_files = [p for p in timelapse_files if p in frame_alignments]
         timelapse_skip_frames = self.config.get('TIMELAPSE_SKIP_FRAMES', 4)
         if repair:
-            timelapse_files = list(night_movie.readable_images(timelapse_files))
+            timelapse_files = list(night_movie.readable_images(
+                self.activity.track('Checking source images', timelapse_files, len(timelapse_files))))
         if len(timelapse_files) <= timelapse_skip_frames:
             task.setFailed('Night/day {}: insufficient readable source images ({} usable, {} skipped).'.format(
                 timespec, len(timelapse_files), timelapse_skip_frames))
@@ -770,6 +771,7 @@ class VideoWorker(Process):
                 self.config,
                 skip_frames=timelapse_skip_frames,
                 pre_processor_class=pre_processor_class,
+                activity=self.activity,
             )
 
             tg.codec = self.config['FFMPEG_CODEC']
@@ -1291,6 +1293,7 @@ class VideoWorker(Process):
                 self.config,
                 skip_frames=0,
                 panorama=panorama,
+                activity=self.activity,
             )
 
             mini_tg.codec = codec
@@ -1510,7 +1513,8 @@ class VideoWorker(Process):
 
         timelapse_skip_frames = self.config.get('TIMELAPSE_SKIP_FRAMES', 4)
         if repair:
-            timelapse_files = list(night_movie.readable_images(timelapse_files))
+            timelapse_files = list(night_movie.readable_images(
+                self.activity.track('Checking source images', timelapse_files, len(timelapse_files))))
         if len(timelapse_files) <= timelapse_skip_frames:
             task.setFailed('Panorama {} {}: insufficient readable source images ({} usable, {} skipped).'.format(
                 timeofday, timespec, len(timelapse_files), timelapse_skip_frames))
@@ -1570,6 +1574,7 @@ class VideoWorker(Process):
                 self.config,
                 skip_frames=timelapse_skip_frames,
                 panorama=True,
+                activity=self.activity,
             )
 
             panorama_tg.codec = codec
@@ -1954,7 +1959,8 @@ class VideoWorker(Process):
 
         stg = (derived_media.make_startrails(self.config, timelapse_skip_frames, camera, detection_mask_dict)
                if night else None)
-        derived_media.process_frames(self.config, files_entries, kg, stg)
+        stack_frames = self.activity.track('Stacking frames', files_entries, image_count)
+        derived_media.process_frames(self.config, stack_frames, kg, stg)
 
         kg.finalize(keogram_file, camera)
 
@@ -2083,6 +2089,7 @@ class VideoWorker(Process):
                     st_tg = TimelapseGenerator(
                         self.config,
                         skip_frames=0,
+                        activity=self.activity,
                     )
 
                     st_tg.codec = self.config['FFMPEG_CODEC']

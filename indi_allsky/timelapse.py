@@ -1,9 +1,11 @@
 import os
+import re
 import time
 from pathlib import Path
 import subprocess
 import tempfile
 import logging
+from threading import Thread
 
 from . import timelapse_preprocessor
 from .exceptions import TimelapseException
@@ -12,6 +14,27 @@ from .panorama import panoramaVideoOptions
 
 logger = logging.getLogger('indi_allsky')
 
+
+
+def _preserves_frame_count(video_filter, extra_options):
+    """Only advertise an output total for filters with one output per input."""
+    filters = [video_filter] if video_filter else []
+    options = iter(extra_options)
+    for option in options:
+        flag = option.split(':')[0]
+        if flag in ('-vf', '-filter'):
+            filters.append(next(options, ''))
+        elif flag in ('-r', '-fpsmax', '-fps_mode', '-vsync', '-frames', '-vframes', '-filter_complex',
+                      '-filter_script', '-filter_complex_script', '-t', '-to', '-ss', '-progress'):
+            return False
+
+    spatial = {'crop', 'scale', 'setsar', 'format', 'hflip', 'vflip', 'transpose', 'split', 'hstack', 'sendcmd'}
+    for graph in filters:
+        # A chain can start after input labels and a filter can have an @instance name.
+        names = re.findall(r'(?:^|[,;])\s*(?:\[[^\]]+\]\s*)*(\w+)(?:@[\w-]+)?\s*(?==|[,;\[]|$)', graph)
+        if not names or any(name not in spatial for name in names):
+            return False
+    return True
 
 
 class TimelapseGenerator(object):
@@ -29,10 +52,12 @@ class TimelapseGenerator(object):
         skip_frames=0,
         pre_processor_class='standard',
         panorama=False,
+        activity=None,
     ):
         self.config = config
         self.skip_frames = skip_frames
         self.panorama = panorama
+        self.activity = activity
 
         self._codec = 'libx264'
         self._framerate = 25
@@ -120,13 +145,16 @@ class TimelapseGenerator(object):
 
         # process images
         stream = None
+        frame_count = len(file_list_ordered)
         if self.pre_processor.frame_alignments and hasattr(self.pre_processor, 'encoded_frames'):
             suffix = '.jpg' if self.config['IMAGE_FILE_TYPE'] in ('jpg', 'jpeg') else '.png'
             codec = 'mjpeg' if suffix == '.jpg' else 'png'
             source = ['-f', 'image2pipe', '-c:v', codec, '-i', 'pipe:0']
             stream = self.pre_processor.encoded_frames(file_list_ordered, suffix)
         else:
-            self.pre_processor.main(file_list_ordered)
+            prepared_count = self.pre_processor.main(file_list_ordered, activity=self.activity)
+            if prepared_count is not None:
+                frame_count = prepared_count
             source = ['-f', 'image2', '-i', str(self.pre_processor.seqfolder / ('%05d.' + self.config['IMAGE_FILE_TYPE']))]
 
 
@@ -175,6 +203,13 @@ class TimelapseGenerator(object):
             cmd.extend(extra_options)
 
 
+        # With a custom frame-rate/filter graph the output frame count may differ
+        # from the input count. Keep source progress, but do not guess an encode total.
+        report_encoding = (self.activity is not None and frame_count > 0
+                           and _preserves_frame_count(self.video_filter, extra_options))
+        if report_encoding:
+            cmd.extend(['-nostats', '-progress', 'pipe:1'])
+
         # finally add filename
         cmd.append('{0:s}'.format(str(video_file_p)))
 
@@ -189,12 +224,7 @@ class TimelapseGenerator(object):
 
 
         try:
-            if stream is None:
-                ffmpeg_subproc = subprocess.run(cmd, env=ffmpeg_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                               preexec_fn=lambda: os.nice(19), check=True)
-                output = ffmpeg_subproc.stdout
-            else:
-                output = self._encode_stream(cmd, ffmpeg_env, stream)
+            output = self._encode(cmd, ffmpeg_env, stream, frame_count if report_encoding else None)
             elapsed_s = time.time() - start
             logger.info('Timelapse generated in %0.4f s', elapsed_s)
 
@@ -226,24 +256,50 @@ class TimelapseGenerator(object):
 
 
 
-    @staticmethod
-    def _encode_stream(cmd, env, frames):
-        # Collect diagnostics without blocking ffmpeg while feeding its input.
+    def _encode(self, cmd, env, frames, total):
+        # Keep diagnostics separate from FFmpeg's machine-readable progress.
+        # When stdin carries aligned images, drain stdout while writing them.
         with tempfile.TemporaryFile() as log, subprocess.Popen(
-                cmd, env=env, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
+                cmd, env=env, stdin=subprocess.PIPE if frames is not None else None,
+                stdout=subprocess.PIPE if total else log, stderr=log,
                 preexec_fn=lambda: os.nice(19)) as encoder:
+            reader = None
             try:
-                with encoder.stdin:
-                    for frame in frames:
-                        encoder.stdin.write(frame)
-            except BrokenPipeError:
-                pass  # Report the encoder's actual exit status and diagnostics.
+                if total:
+                    self.activity.progress('Encoding frames', 0, total)
+                    if frames is None:
+                        self._read_progress(encoder.stdout, total)
+                    else:
+                        reader = Thread(target=self._read_progress, args=(encoder.stdout, total))
+                        reader.start()
+                if frames is not None:
+                    try:
+                        with encoder.stdin:
+                            for frame in frames:
+                                encoder.stdin.write(frame)
+                    except BrokenPipeError:
+                        pass  # Report the encoder's exit status and diagnostics.
+                code = encoder.wait()
             except BaseException:
                 encoder.kill()
+                encoder.wait()
                 raise
-            code = encoder.wait()
+            finally:
+                if reader is not None:
+                    reader.join()
+                if total:
+                    self.activity.finish_progress()
             log.seek(0)
             output = log.read()
             if code:
                 raise subprocess.CalledProcessError(code, cmd, output=output)
             return output
+
+
+    def _read_progress(self, stream, total):
+        for line in stream:
+            key, _, value = line.partition(b'=')
+            if key == b'frame' and value.strip().isdigit():
+                done = int(value)
+                if 0 < done <= total:
+                    self.activity.progress('Encoding frames', done, total)
