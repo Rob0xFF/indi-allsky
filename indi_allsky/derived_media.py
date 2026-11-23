@@ -109,7 +109,13 @@ def process_frames(config, entries, kg, stg, checkpoint=None):
                 if solution:
                     kg.x_offset = kg.y_offset = 0
                     strip_image = remap.image(data, solution)
+                previous_data = getattr(kg, 'keogram_data', None)
+                previous_width = previous_data.shape[1] if previous_data is not None else 1
                 kg.processImage(strip_image, path.stat().st_mtime)
+                if getattr(kg, 'keogram_data', None) is not None and kg.keogram_data.shape[1] > previous_width:
+                    if not hasattr(kg, 'report_entries'):
+                        kg.report_entries = []
+                    kg.report_entries.append(entry)
             except KeogramMismatchException as exc:
                 logger.warning('Skipping incompatible keogram image: %s', exc)
         if stg is not None:
@@ -305,6 +311,10 @@ def publish(worker, camera, date, night, missing, scratch, name, token, summary)
                     (kind != 'startrail_timelapse' and decodable_image(current))):
                 db.session.rollback()
                 continue
+        old_report_paths = {}
+        if kind == 'keogram' and row is not None:
+            from .night_report_service import report_paths
+            old_report_paths = report_paths(row)
         prefix = 'allsky-{}_ccd{}_{}_{}_'.format(kind, camera.id, date.strftime('%Y%m%d'), 'night' if night else 'day')
         final = temp.parent.parent / (prefix + uuid.uuid4().hex + temp.suffix)
         os.replace(temp, final)
@@ -318,12 +328,19 @@ def publish(worker, camera, date, night, missing, scratch, name, token, summary)
         row.width, row.height = size
         row.success = True
         row.data = dict(row.data or {}, **summary)
+        if kind == 'keogram':
+            row.data.pop('night_report', None)
         row.sync_id = None
         row.uploaded = False
         if kind == 'startrail_timelapse':
             row.framerate = worker.config.get('FFMPEG_FRAMERATE', 25)
         db.session.commit()  # retain existing ID, publish only the validated complete file
         published.append(kind)
+        for stale_report in old_report_paths.values():
+            try:
+                stale_report.unlink(missing_ok=True)
+            except OSError:
+                logger.warning('Could not remove replaced Night Report %s', stale_report)
         try:
             export(worker, camera, row, kind)
         except Exception:
@@ -475,4 +492,7 @@ def reconcile_locked(worker, camera, date, night):
     record['result'] = task.result
     State.query.filter_by(key=name, value=token).update({'value':json.dumps(record)}, synchronize_session=False)
     db.session.commit()
+    if night and 'keogram' in published:
+        from .night_report_service import reconcile as reconcile_report
+        reconcile_report(worker, camera, date)
     return bool(len(sources) > cfg.get('TIMELAPSE_SKIP_FRAMES', 4))

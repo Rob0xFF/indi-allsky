@@ -30,6 +30,9 @@ from PIL import Image
 from fractions import Fraction
 
 from .worker_activity import WorkerActivity
+from .night_report_data import sensor_slots as night_report_sensor_slots
+from .night_report_data import metric_catalog as night_report_metric_catalog
+from .companion_astronomy import camera_timezone as report_camera_timezone
 from . import constants
 from .archive_health import device_error, storage_errno
 from . import asi676mc
@@ -948,6 +951,30 @@ class ImageWorker(Process):
             image_add_data['temp_display'] = self.config.get('TEMP_DISPLAY', 'c')
             image_add_data['pressure_display'] = self.config.get('PRESSURE_DISPLAY', 'hPa')
             image_add_data['windspeed_display'] = self.config.get('WINDSPEED_DISPLAY', 'ms')
+
+            # Keep mobile observing locations and sensor assignments with the
+            # exposure, so a later report cannot silently use a new setup.
+            if not hasattr(self, '_night_report_slots'):
+                try:
+                    self._night_report_slots = night_report_sensor_slots(self.config)
+                    self._night_report_metrics = night_report_metric_catalog(self.config)
+                    self._night_report_timezone = getattr(report_camera_timezone(camera), 'key', None)
+                except Exception:
+                    logger.exception('Could not record night-report sensor assignments')
+                    self._night_report_slots = {}
+                    self._night_report_metrics = []
+                    self._night_report_timezone = None
+            report_location = [float(self.position_av[index]) for index in
+                               (constants.POSITION_LATITUDE, constants.POSITION_LONGITUDE,
+                                constants.POSITION_ELEVATION)]
+            if self.config.get('PRIVACY_MODE'):
+                report_location = [round(value) for value in report_location]
+            image_add_data['night_report_context'] = {
+                'location': report_location,
+                'sensors': self._night_report_slots,
+                'metrics': self._night_report_metrics,
+                'timezone': self._night_report_timezone,
+            }
 
 
             if self.adsb_aircraft_list:

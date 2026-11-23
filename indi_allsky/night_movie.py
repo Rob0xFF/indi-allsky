@@ -342,7 +342,7 @@ def reconcile(worker):
         IndiAllSkyDbPanoramaVideoTable as PanoMovie, IndiAllSkyDbTaskQueueTable as Task,
         TaskQueueQueue, TaskQueueState)
     from .utils import IndiAllSkyDateCalcs
-    from . import derived_media
+    from . import derived_media, night_report_service
 
     config = worker.config
     if (not config.get('TIMELAPSE_ENABLE', True) or config.get('CAPTURE_PAUSE')
@@ -358,7 +358,7 @@ def reconcile(worker):
     today = IndiAllSkyDateCalcs(config, [camera.latitude, camera.longitude, camera.elevation or 0]).getDayDate()
     days = min(config.get('IMAGE_EXPIRE_DAYS', 10), config.get('TIMELAPSE_EXPIRE_DAYS', 365))
     if days <= 0:
-        return False
+        return night_report_service.reconcile_cached(worker, camera, today, today)
     cutoff = today - timedelta(days=days)
     outstanding = set()
     for task in Task.query.filter(Task.queue == TaskQueueQueue.VIDEO, Task.state.in_(
@@ -403,11 +403,15 @@ def reconcile(worker):
                     return True
             if not worker._shutdown and not archive_paused(config) and derived_media.reconcile(worker, camera, date, night):
                 return True
+            if night and night_report_service.reconcile(worker, camera, date):
+                return True
         return False
 
     for offset in range(1, min(RECENT_DAYS, days) + 1):
         if check_period(today - timedelta(days=offset)):
             return True
+    if night_report_service.reconcile_cached(worker, camera, today, cutoff):
+        return True
     if days <= RECENT_DAYS or worker._shutdown:
         return False
 

@@ -27,13 +27,15 @@ PHASES = {
               'Generating keogram and star trails', 'Generating star trails', 'Encoding star-trail timelapse',
               'Removing expired media', 'Backing up database', 'Checking system health',
               'Preparing end-of-night upload', 'Updating aurora data', 'Updating smoke data',
-              'Updating satellite data', 'Contacting all-sky map'),
+              'Updating satellite data', 'Contacting all-sky map', 'Generating night report'),
     'calibration': ('Calibrating ASI676MC images',),
 }
 
 
 def media_phase(action, kwargs):
     night = kwargs.get('night')
+    if action == 'generateNightReport':
+        return 'Generating night report'
     if action == 'generateKeogramStarTrails':
         return 'Generating keogram and star trails' if night else 'Generating keogram'
     if action == 'generateVideo':
@@ -54,7 +56,8 @@ def media_phase(action, kwargs):
 
 # Only these application stages cross the web boundary. A single fixed-size
 # pread/pwrite transfers a snapshot; frames never write to VARLIB_FOLDER.
-_STAGES = ('Checking source images', 'Preparing frames', 'Stacking frames', 'Encoding frames')
+_STAGES = ('Checking source images', 'Preparing frames', 'Stacking frames', 'Encoding frames',
+           'Reading night report frames')
 _PROGRESS = struct.Struct('!8sBQQdd')
 _PUBLISH_INTERVAL = 1.0
 

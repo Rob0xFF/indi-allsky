@@ -20,7 +20,7 @@ DISK_ERRORS = {errno.ENOSPC, errno.EROFS, errno.EDQUOT, errno.EIO, errno.ENODEV,
 MIB = 1024 * 1024
 STATUS_FILE = 'archive-health.json'
 VIDEO_ACTIONS = {'generateVideo', 'generateMiniVideo', 'generatePanoramaMiniVideo', 'generatePanoramaVideo',
-                 'generateKeogramStarTrails', 'generateAsi676mcCalibration', 'uploadAllskyEndOfNight',
+                 'generateKeogramStarTrails', 'generateNightReport', 'generateAsi676mcCalibration', 'uploadAllskyEndOfNight',
                  'backupDatabase'}
 
 

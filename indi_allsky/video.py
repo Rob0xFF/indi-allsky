@@ -1989,6 +1989,10 @@ class VideoWorker(Process):
         keogram_entry.success = True
         db.session.commit()
 
+        if night:
+            # Report errors must not invalidate a usable keogram or star trails.
+            from .night_report_service import build_report
+            build_report(self, camera, keogram_entry, keogram_source=kg)
 
         keogram_thumbnail_metadata = {
             'type'       : constants.THUMBNAIL,
@@ -2176,6 +2180,28 @@ class VideoWorker(Process):
 
 
         task.setSuccess('Generated keogram and/or star trail')
+
+
+    def generateNightReport(self, task, **kwargs):
+        """Regenerate only a selected night's report; never re-encode its movies."""
+        from .night_report_service import build_report
+        try:
+            camera_id = int(kwargs['camera_id'])
+            keogram_id = int(kwargs['keogram_id'])
+        except (KeyError, ValueError, TypeError):
+            task.setFailed('Invalid Night Report selection')
+            return
+        camera = IndiAllSkyDbCameraTable.query.filter_by(id=camera_id, local=True, hidden=False).first()
+        keogram = IndiAllSkyDbKeogramTable.query.filter_by(
+            id=keogram_id, camera_id=camera_id, night=True, success=True).first()
+        if camera is None or keogram is None:
+            task.setFailed('Night keogram is no longer available')
+            return
+        task.setRunning()
+        if build_report(self, camera, keogram, force=True):
+            task.setSuccess('Generated Night Report')
+        else:
+            task.setFailed('Night Report is waiting; check source data and archive status')
 
 
     def uploadAllskyEndOfNight(self, task, **kwargs):
