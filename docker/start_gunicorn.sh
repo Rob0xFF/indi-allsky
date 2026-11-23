@@ -158,6 +158,7 @@ exec gunicorn \
     --bind 0.0.0.0:8000 \
     --worker-class gthread \
     --threads 8 \
+    --no-sendfile \
     --timeout 180 \
     --umask 0022 \
     --log-level info \

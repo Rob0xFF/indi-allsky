@@ -1,5 +1,7 @@
 worker_class            = 'gthread'
 threads                 = 8
+# gthread sockets are non-blocking; Python's socket.sendfile requires blocking I/O.
+sendfile                = False
 timeout                 = 180
 syslog                  = True
 syslog_addr             = 'unix:///dev/log'
